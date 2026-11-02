@@ -3,6 +3,9 @@
 > Objetivo: medir, com a maior precisão possível, **quanto tempo por dia o telefone fica
 > desbloqueado e em uso**, guardar o histórico por data e calcular médias confiáveis
 > (diária, semanal, mensal, dias úteis × fim de semana, tendência).
+>
+> **Toda data e hora gravada pelo app vem da internet** (hora oficial sincronizada), não do
+> relógio do aparelho, que pode estar errado ou ser alterado pelo usuário (Seção 3).
 
 ---
 
@@ -38,7 +41,7 @@ TTD = soma das durações dos intervalos em que
 - **Desbloqueios por dia** (transições bloqueado → desbloqueado).
 - **Sessões**: quantidade, duração média, **mediana**, maior sessão.
 - **Intervalo médio entre desbloqueios**.
-- **Primeiro desbloqueio** e **último bloqueio** do dia.
+- **Primeiro desbloqueio** e **último bloqueio** do dia (com a hora da internet).
 - **Distribuição por hora do dia** (mapa de calor 24 × 7).
 - (Fase posterior) **Tempo por app** via eventos `ACTIVITY_RESUMED/PAUSED`, apenas como
   detalhamento — nunca como base do total.
@@ -48,11 +51,11 @@ TTD = soma das durações dos intervalos em que
 O Bem-estar Digital (e equivalentes de fabricantes) soma o **tempo de apps em primeiro
 plano**; a métrica aqui é **do dispositivo** (desbloqueado + tela interativa). Os números
 vão diferir em alguns minutos por dia, e isso é esperado. A comparação com o Bem-estar
-Digital será usada só como verificação de sanidade (Seção 9).
+Digital será usada só como verificação de sanidade (Seção 11).
 
 ---
 
-## 2. Pesquisa: fontes de dados disponíveis no Android
+## 2. Pesquisa: fontes de dados de uso no Android
 
 ### 2.1 `UsageStatsManager.queryEvents()` — **fonte principal escolhida**
 
@@ -87,23 +90,28 @@ O que foi confirmado lendo o código-fonte do AOSP (`frameworks/base`, branch `m
    **queda abrupta** (bateria acabou, travamento) perdem-se até ~20 min de eventos. No
    boot seguinte o sistema insere um `DEVICE_SHUTDOWN` sintético com o timestamp da última
    gravação.
-4. **Correção de relógio** — quando o relógio muda mais de 2 s
+4. **Os timestamps dos eventos usam o relógio do aparelho** (`System.currentTimeMillis()`).
+   Internamente, o sistema registra o evento com `elapsedRealtime` e converte usando um par
+   de referência (`mRealTimeSnapshot`/`mSystemTimeSnapshot`). **Se o relógio do aparelho
+   estiver errado, todos os eventos ficam com a hora errada** — por isso a Seção 3 converte
+   cada evento para a hora da internet.
+5. **Correção de relógio** — quando o relógio muda mais de 2 s
    (`TIME_CHANGE_THRESHOLD_MILLIS`), o sistema **desloca todo o histórico armazenado pela
    mesma diferença** (`UsageStatsDatabase.onTimeChanged()` renomeia os arquivos). Os
    timestamps de eventos já lidos por nós podem, portanto, voltar **diferentes** numa nova
-   consulta. Isso afeta a deduplicação (Seção 5.3).
-5. **Os buckets agregados do sistema não servem como fonte de dados diária**: o bucket
+   consulta. Isso afeta a deduplicação e a conversão para a hora real (Seções 3.4 e 6.3).
+6. **Os buckets agregados do sistema não servem como fonte de dados diária**: o bucket
    diário começa no instante da última virada (`UnixCalendar`, sem fuso horário), e não à
    meia-noite local. Além disso, o `queryEventStats()` informa a duração de
    `KEYGUARD_HIDDEN` incluindo tempo de tela **apagada** (bloqueio com atraso). Portanto
    **não dá para obter a interseção "interativo E desbloqueado" pelos agregados**;
    calcularemos tudo a partir dos eventos brutos.
-6. A partir do Android 11, `queryEvents` retorna vazio enquanto o usuário não desbloquear o
+7. A partir do Android 11, `queryEvents` retorna vazio enquanto o usuário não desbloquear o
    aparelho após o boot (`isUserUnlocked() == false`).
-7. No Android 15 (API 35) existe `queryEvents(UsageEventsQuery)` com
+8. No Android 15 (API 35) existe `queryEvents(UsageEventsQuery)` com
    `setEventTypes(...)`, que filtra no sistema e é bem mais eficiente. Nas versões
    anteriores, filtra-se durante a iteração.
-8. Os eventos ainda não gravados em disco (em memória) **são retornados** pela consulta, ou
+9. Os eventos ainda não gravados em disco (em memória) **são retornados** pela consulta, ou
    seja, os dados são praticamente em tempo real.
 
 **Vantagens:** retroativo (instalou hoje → já tem cerca de 10 dias de histórico), não exige
@@ -128,8 +136,8 @@ no máximo, como verificação cruzada opcional no futuro.
 
 ### 2.4 Broadcasts úteis e isentos (registráveis no manifest)
 
-`BOOT_COMPLETED`, `TIME_SET`, `TIMEZONE_CHANGED`. Servem para disparar a ingestão e
-registrar mudanças de relógio/fuso.
+`BOOT_COMPLETED`, `TIME_SET`, `TIMEZONE_CHANGED`. Servem para disparar a ingestão, a
+sincronização da hora pela internet e o registro de mudanças de relógio/fuso.
 
 ### 2.5 Descartados
 
@@ -140,54 +148,193 @@ registrar mudanças de relógio/fuso.
 
 ---
 
-## 3. Arquitetura
+## 3. Data e hora pela internet (relógio confiável)
+
+### 3.1 Por que
+
+O relógio do aparelho (`System.currentTimeMillis()`) pode estar adiantado/atrasado (sem
+"data e hora automáticas"), ser alterado manualmente (inclusive para "burlar" o
+contador do dia) ou estar errado logo após o boot. Como **todos os eventos do sistema são
+carimbados com esse relógio**, um relógio errado faria o uso cair no **dia errado**, deixaria
+o "primeiro desbloqueio" e o mapa por hora errados e quebraria as médias.
+
+**Regra do app:** nenhum valor de data/hora é gravado ou exibido com base no relógio do
+aparelho. Tudo é convertido para a **hora UTC obtida pela internet** e, depois, para a data
+local pelo fuso de referência (Seção 8).
+
+### 3.2 Fontes de hora pela internet (em cascata)
+
+| Prioridade | Fonte | Como | Precisão típica | Observações |
+|---|---|---|---|---|
+| 1 | **Google TrustedTime** (Play services, `com.google.android.gms:play-services-time:16.0.1+`) | `TrustedTime.createClient(ctx)` → `client.getLatestTimeSignal()?.computeCurrentInstant()` → `getInstantMillis()` + `getEstimatedErrorMillis()` | dezenas de ms, **com estimativa de erro** | sincroniza periodicamente com servidores do Google; não depende do relógio do aparelho; retorna `null` se não houve internet desde o boot; exige Play services |
+| 2 | **`SystemClock.currentNetworkTimeClock()`** (API 33+) | `.millis()` | dezenas de ms | hora da última sincronização de rede do sistema; **não ajustável pelo usuário**; não bloqueia; lança `DateTimeException` se indisponível |
+| 3 | **Cliente SNTP próprio** (UDP 123) | servidores **NTP.br** (`a.st1.ntp.br` … `e.st1.ntp.br`, ligados aos relógios de césio da Hora Legal Brasileira) e `time.google.com` | ~10–50 ms | funciona sem Play services (ex.: Huawei); algumas redes bloqueiam UDP 123 |
+| 4 | **Cabeçalho HTTP `Date`** via HTTPS (fallback) | `HEAD https://www.google.com`, usar o ponto médio do RTT | ~0,5–1 s | resolução de 1 s; autenticado por TLS; falha se o relógio do aparelho estiver tão errado que invalide o certificado |
+| — | Nenhuma disponível | usar o último desvio conhecido da mesma **época de relógio** (3.4); se não houver, relógio do aparelho com marca `HORA_NAO_VERIFICADA` | — | corrigido **retroativamente** quando a internet voltar (3.5) |
+
+Verificação cruzada: quando duas fontes estiverem disponíveis e divergirem em mais de 2 s,
+vale a de **menor erro estimado**, e a divergência é registrada (`time_sync.disagreement`).
+
+Cálculo SNTP (fonte 3), com `t0` (envio) e `t3` (recebimento) medidos pelo relógio
+monotônico `elapsedRealtimeNanos`, e `t1`/`t2` sendo os carimbos do servidor:
+
+```
+θ = ((t1 − t0) + (t2 − t3)) / 2     → hora_real = elapsedRealtime + θ   (vira a âncora, 3.3)
+erro ≈ RTT / 2 = ((t3 − t0) − (t2 − t1)) / 2
+```
+
+Fazer de 4 a 8 consultas, escolher a de **menor RTT** e descartar respostas com
+`stratum = 0`, *Kiss-o'-Death* ou `leap = 3`.
+
+### 3.3 Âncora monotônica: a hora real sem depender do relógio do aparelho
+
+Cada sincronização bem-sucedida grava um par:
+
+```
+(elapsedRealtime_ms, boot_count)  ↔  hora_real_utc_ms   (+ relógio_do_aparelho_ms, erro_ms, fonte)
+```
+
+`elapsedRealtime` é monotônico, conta inclusive o sono profundo e **não muda quando o
+usuário altera o relógio**. A partir da âncora:
+
+```
+agora_real          = hora_real_da_âncora + (elapsedRealtime_agora − elapsedRealtime_da_âncora)
+desvio_do_aparelho  = relógio_do_aparelho − hora_real      (no instante da âncora)
+```
+
+`BOOT_COUNT` (`Settings.Global.BOOT_COUNT`) identifica o boot, porque o `elapsedRealtime`
+zera a cada reinício. O erro estimado cresce com a idade da âncora (deriva do cristal,
+~±50 ppm ≈ ±4 s/dia), por isso há **ressincronização periódica**.
+
+### 3.4 Converter os eventos do sistema para hora real
+
+Os eventos chegam com a hora do aparelho. Definição: **época de relógio** = período em que
+a relação entre o relógio do aparelho e o `elapsedRealtime` é constante. Ela começa no boot
+ou numa mudança de relógio (`TIME_SET` ou salto > 2 s detectado pela âncora).
+
+Ponto-chave (do item 2.1-5): quando o relógio muda, o **sistema desloca todo o histórico**
+para o novo referencial. Logo, **todos os eventos retornados por uma consulta estão no
+referencial do relógio vigente no momento da consulta**, e a conversão correta é:
+
+```
+ts_real = ts_do_evento − desvio_do_aparelho_vigente_na_consulta
+```
+
+Procedimento em cada ingestão:
+1. Obter o desvio vigente: sincronizar se não houver âncora válida na época atual ou se ela
+   tiver mais de 6 h.
+2. Consultar os eventos e converter **todos** com esse desvio.
+3. Gravar no banco o timestamp original (`ts_device_ms`), o convertido (`ts_utc_ms`), o
+   desvio, o erro e a qualidade.
+4. Eventos já gravados são **imutáveis** (já estão em hora real). Como a ingestão é
+   frequente, quase todos os eventos são convertidos na mesma época em que ocorreram.
+
+Durações **não mudam** com um desvio constante (o desvio cancela na subtração); o que muda
+é **em que dia e em que hora** o uso é contabilizado.
+
+### 3.5 Qualidade da hora e correção retroativa
+
+| Qualidade | Significado |
+|---|---|
+| `VERIFICADA` | desvio medido na mesma época de relógio, com erro ≤ 2 s |
+| `INFERIDA` | desvio de uma época anterior aplicado a eventos do backfill, ou âncora com erro > 2 s |
+| `NAO_VERIFICADA` | sem nenhuma sincronização disponível; usado o relógio do aparelho |
+
+Quando a primeira sincronização de uma época acontece (internet voltou), os eventos
+`NAO_VERIFICADA` **da mesma época** (mesmo `boot_count` e sem salto de relógio entre eles)
+são reconvertidos com o novo desvio, e as sessões e os dias afetados são recalculados. Isso
+é seguro porque o algoritmo é idempotente a partir dos eventos brutos.
+
+### 3.6 Quando sincronizar
+
+| Gatilho | Observação |
+|---|---|
+| `TimeSyncWorker` periódico a cada **6 h**, com restrição `NetworkType.CONNECTED` | mantém a âncora fresca |
+| Antes de cada ingestão, se não houver âncora válida na época atual | garante a conversão correta |
+| `BOOT_COMPLETED`, `TIME_SET`, `TIMEZONE_CHANGED` | nova época de relógio |
+| App aberto: `TrustedTimeClient.addTimeSignalListener(...)` | atualização imediata quando chega um sinal novo |
+| Conectividade restabelecida após período sem internet | dispara a correção retroativa (3.5) |
+
+### 3.7 Exemplo prático
+
+O aparelho marca **23:58** do dia 10, mas a hora real (internet) é **00:03** do dia 11 (relógio
+5 min atrasado). Um desbloqueio nesse instante é contado no **dia 11**. Se o usuário
+adiantar o relógio para o dia seguinte, o tempo de uso **continua** no dia real.
+
+### 3.8 Aviso ao usuário
+
+Se `|desvio_do_aparelho| > 1 min`, a tela Hoje mostra: "O relógio do aparelho está X min
+adiantado/atrasado — o app usa a hora oficial da internet."
+
+---
+
+## 4. Arquitetura
 
 ```
 ┌─────────────────────────── :app (Android) ────────────────────────────┐
 │ UI (Compose): Hoje · Histórico · Médias · Qualidade dos dados · Ajustes│
-│ Workers (WorkManager) · Receivers (BOOT/TIME_SET/TIMEZONE)             │
-│ UsageEventSource (UsageStatsManager)  ·  Room (banco local)            │
+│ Workers (WorkManager): Ingestão · TimeSync · Fechamento diário         │
+│ Receivers (BOOT/TIME_SET/TIMEZONE)                                     │
+│ UsageEventSource (UsageStatsManager) · Room (banco local)              │
+│ NetworkTimeSources: TrustedTime · NetworkClock(API33) · SNTP · HTTPS   │
 └──────────────────────────────┬────────────────────────────────────────┘
                                │ usa
 ┌──────────────────────────────▼────────────────────────────────────────┐
 │ :core (Kotlin puro, sem Android → testável em JVM)                    │
+│  TrustedClock (âncoras, épocas, desvio, qualidade) · SntpMath         │
 │  Sessionizer (máquina de estados) · DaySplitter (fuso/DST)            │
 │  CoverageCalculator · StatsEngine (médias, mediana, desvio, tendência)│
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
 - **Linguagem:** Kotlin. **UI:** Jetpack Compose. **Persistência:** Room.
-  **Agendamento:** WorkManager. **Datas:** `java.time` (nativo).
+  **Agendamento:** WorkManager. **Datas:** `java.time` (nativo). **Hora real:**
+  `play-services-time` + `SystemClock.currentNetworkTimeClock()` + SNTP próprio (sem
+  bibliotecas extras; o protocolo SNTP cabe em ~80 linhas).
 - **minSdk 29** (Android 10), recomendado: garante `DEVICE_STARTUP/SHUTDOWN`. Com minSdk 28,
   o reboot teria de ser inferido por heurística. **targetSdk:** o mais recente.
 - **Separar o núcleo (`:core`)** permite testar todo o algoritmo com sequências sintéticas
-  de eventos, sem emulador.
+  de eventos e relógios simulados, sem emulador.
+- **Uma única fonte de "agora"** no código: a interface `TrustedClock.now()`. É proibido
+  usar `System.currentTimeMillis()`, `Instant.now()` ou `LocalDate.now()` fora do adaptador
+  do relógio do aparelho (verificação por regra de lint/Detekt).
 
 ---
 
-## 4. Modelo de dados (Room)
+## 5. Modelo de dados (Room)
 
 ```text
-raw_event        (id PK, ts_utc_ms, type, pkg, cls, seq_in_batch, ingest_run_id)
-                 UNIQUE(ts_utc_ms, type, pkg, cls)
+time_sync        (id PK, elapsed_realtime_ms, boot_count,
+                  device_wall_ms, true_utc_ms, device_offset_ms, error_ms,
+                  source[TRUSTED_TIME|NETWORK_CLOCK|SNTP|HTTPS_DATE],
+                  server, rtt_ms, disagreement_ms, ok, error)
+
+clock_epoch      (id PK, boot_count, start_elapsed_ms, start_device_wall_ms,
+                  reason[BOOT|TIME_SET|JUMP_DETECTED],
+                  best_offset_ms, best_offset_error_ms, best_sync_id)
+
+raw_event        (id PK, ts_device_ms, ts_utc_ms, offset_ms, offset_error_ms,
+                  time_quality[VERIFICADA|INFERIDA|NAO_VERIFICADA], epoch_id,
+                  type, pkg, cls, seq_in_batch, ingest_run_id)
+                 UNIQUE(ts_device_ms, type, pkg, cls, epoch_id)
                  -- apenas tipos 15,16,17,18,26,27 (+1,2 quando houver o detalhamento por app)
 
-ingest_run       (id PK, started_at_utc, query_begin_utc, query_end_utc,
-                  events_read, events_new, ok, error,
-                  elapsed_realtime_ms, boot_count, wall_clock_ms)   -- âncora de relógio
+ingest_run       (id PK, started_at_utc, query_begin_device, query_end_device,
+                  events_read, events_new, offset_ms, ok, error,
+                  elapsed_realtime_ms, boot_count, device_wall_ms)   -- âncora de relógio
 
 clock_event      (id PK, detected_at_utc, kind[TIME_SET|TIMEZONE_CHANGED|REBOOT],
                   delta_ms, old_zone, new_zone)
 
-zone_history     (effective_from_utc PK, zone_id)   -- ex.: "America/Sao_Paulo"
+zone_history     (effective_from_utc PK, zone_id)   -- fuso do aparelho ao longo do tempo
 
 permission_log   (ts_utc, granted BOOLEAN)          -- acesso ao uso concedido/revogado
 
-session          (id PK, start_utc, end_utc, duration_ms,
+session          (id PK, start_utc, end_utc, duration_ms,           -- hora real (internet)
                   start_reason[UNLOCK|SCREEN_ON_NO_KEYGUARD],
                   end_reason[SCREEN_OFF|KEYGUARD_SHOWN|SHUTDOWN|SHUTDOWN_ESTIMATED|OPEN],
                   flags BITMASK[LONG|TIME_CHANGED|ESTIMATED_END|OUT_OF_ORDER],
-                  algo_version)
+                  time_quality, algo_version)
 
 daily_summary    (local_date PK, zone_id, day_length_ms,          -- 23h/24h/25h (DST)
                   unlocked_ms, screen_on_ms, unlocks, sessions,
@@ -195,83 +342,93 @@ daily_summary    (local_date PK, zone_id, day_length_ms,          -- 23h/24h/25h
                   first_unlock_local, last_lock_local,
                   covered_ms, coverage_ratio,
                   status[COMPLETE|PARTIAL|NO_DATA|GAP],
+                  time_quality, max_time_error_ms,
                   quality_flags, algo_version, computed_at_utc)
 
 hourly_bucket    (local_date, hour 0..23, unlocked_ms, unlocks)    -- mapa de calor
 ```
 
 Princípios:
-- **Todos os instantes são guardados em UTC (ms)**. Datas locais só existem nas tabelas
-  agregadas, sempre com o `zone_id` usado.
+- **Todos os instantes são guardados em UTC real (internet), em ms.** O timestamp original
+  do aparelho é mantido só para auditoria e deduplicação.
+- Datas locais só existem nas tabelas agregadas, sempre com o `zone_id` usado.
 - **`algo_version`**: ao mudar o algoritmo, os resumos são recalculados a partir dos
-  `raw_event`, que são a fonte da verdade e são imutáveis.
+  `raw_event`, que são a fonte da verdade.
 - O histórico além de 10 dias existe **só no nosso banco**, por isso backup e exportação
-  são importantes (Seção 8).
+  são importantes (Seção 9).
 
 ---
 
-## 5. Ingestão (copiar eventos do sistema antes de expirarem)
+## 6. Ingestão (copiar eventos do sistema antes de expirarem)
 
-### 5.1 Quando rodar
+### 6.1 Quando rodar
 | Gatilho | Por quê |
 |---|---|
 | `PeriodicWorkRequest` a cada **1–3 h** (com flex) | mantém o banco atualizado |
 | Ao abrir o app | dados frescos na tela |
 | `BOOT_COMPLETED` (após o desbloqueio) | captura `DEVICE_SHUTDOWN/STARTUP` |
-| `TIME_SET` / `TIMEZONE_CHANGED` | registra o `clock_event` e o fuso; reingere |
-| Diário, logo após 00:05 local | fecha o dia anterior (`status` final) |
+| `TIME_SET` / `TIMEZONE_CHANGED` | registra o `clock_event` e o fuso; ressincroniza a hora; reingere |
+| Logo após a **meia-noite real** (+5 min), agendado por atraso calculado com `TrustedClock` | fecha o dia anterior (`status` final) |
 
 Como os dados são retroativos, **atrasos de Doze/fabricante não causam perda** desde que
 alguma ingestão ocorra em menos de 7 dias.
 
-### 5.2 Algoritmo
+O agendamento do fechamento diário usa **atraso relativo** (`setInitialDelay` =
+`meia-noite_real − agora_real`), nunca um horário do relógio do aparelho.
+
+### 6.2 Algoritmo
 1. Verificar a permissão: `AppOpsManager.unsafeCheckOpNoThrow(OPSTR_GET_USAGE_STATS, uid, pkg)`.
    Se negada, gravar em `permission_log`, notificar o usuário e encerrar.
 2. Verificar `UserManager.isUserUnlocked()`; se falso, fazer `retry`.
 3. **Detectar mudança de relógio** comparando com a âncora da última execução
    (mesmo `BOOT_COUNT`): `delta = (wall_agora − wall_ant) − (elapsed_agora − elapsed_ant)`.
-   Se `|delta| > 2 s`, ajustar a marca d'água pelo `delta` e registrar um `clock_event`.
-4. Janela de consulta: `[marca_d'água − 30 min de sobreposição, agora)`, dividida em
-   blocos de 1 dia (consultas menores e retomáveis).
-5. API 35+: `UsageEventsQuery.Builder(begin, end).setEventTypes(15,16,17,18,26,27)`.
+   Se `|delta| > 2 s`, abrir uma nova `clock_epoch`, ajustar a marca d'água pelo `delta` e
+   registrar um `clock_event`.
+4. **Obter o desvio vigente** pelo `TrustedClock` (Seção 3.4); sincronizar se necessário.
+5. Janela de consulta: `[marca_d'água − 30 min de sobreposição, agora)`, no referencial do
+   aparelho, dividida em blocos de 1 dia (consultas menores e retomáveis).
+6. API 35+: `UsageEventsQuery.Builder(begin, end).setEventTypes(15,16,17,18,26,27)`.
    Abaixo disso: `queryEvents(begin, end)` filtrando na iteração.
-6. Inserir com `INSERT OR IGNORE`, preservando a **ordem de iteração** (`seq_in_batch`)
-   para desempate de timestamps iguais.
-7. Avançar a marca d'água e gravar o `ingest_run`.
-8. Re-sessionizar a partir da **última sessão fechada antes da janela** e recalcular os dias
+7. Converter cada evento para `ts_utc_ms` e inserir com `INSERT OR IGNORE`, preservando a
+   **ordem de iteração** (`seq_in_batch`) para desempate de timestamps iguais.
+8. Avançar a marca d'água e gravar o `ingest_run`.
+9. Re-sessionizar a partir da **última sessão fechada antes da janela** e recalcular os dias
    afetados (incremental e idempotente).
 
-### 5.3 Deduplicação com mudança de relógio
+### 6.3 Deduplicação com mudança de relógio
 Como o sistema desloca o histórico quando o relógio muda, um mesmo evento pode reaparecer
-com outro timestamp. Mitigação: (a) nunca reconsultar além da sobreposição curta;
-(b) aplicar o `delta` detectado à marca d'água; (c) marcar os dias envolvidos com a flag
-`TIME_CHANGED`, para transparência.
+com outro timestamp de aparelho. Mitigação: (a) nunca reconsultar além da sobreposição
+curta; (b) aplicar o `delta` detectado à marca d'água; (c) chave única inclui a `epoch_id`;
+(d) após converter para hora real, descartar eventos do mesmo tipo/pacote a menos de 1 s de
+um já existente; (e) marcar os dias envolvidos com a flag `TIME_CHANGED`, para
+transparência.
 
 ---
 
-## 6. Sessionização (máquina de estados)
+## 7. Sessionização (máquina de estados)
 
-Estado: `interactive: Boolean?`, `keyguardShown: Boolean?`, `openSince: Long?`.
+Opera sobre `ts_utc_ms` (hora real). Estado: `interactive: Boolean?`,
+`keyguardShown: Boolean?`, `openSince: Long?`.
 
 ```kotlin
 fun unlocked(s) = s.interactive == true && s.keyguardShown == false
 
-for (e in eventsOrdenadosPor(ts, seq)) {
+for (e in eventsOrdenadosPor(tsUtc, seq)) {
     val antes = unlocked(state)
     when (e.type) {
         SCREEN_INTERACTIVE     -> state.interactive = true
         SCREEN_NON_INTERACTIVE -> state.interactive = false
         KEYGUARD_SHOWN         -> state.keyguardShown = true
         KEYGUARD_HIDDEN        -> state.keyguardShown = false
-        DEVICE_SHUTDOWN        -> { fecharSessao(e.ts, SHUTDOWN_ESTIMATED); state = DESCONHECIDO }
+        DEVICE_SHUTDOWN        -> { fecharSessao(e.tsUtc, SHUTDOWN_ESTIMATED); state = DESCONHECIDO }
         DEVICE_STARTUP         -> { state = DESCONHECIDO_POS_BOOT }
     }
     val depois = unlocked(state)
-    if (!antes && depois) abrirSessao(e.ts)
-    if (antes && !depois) fecharSessao(e.ts, motivo(e))
+    if (!antes && depois) abrirSessao(e.tsUtc)
+    if (antes && !depois) fecharSessao(e.tsUtc, motivo(e))
 }
-// Sessão ainda aberta: NÃO é persistida como fechada; a UI usa
-// agora() se PowerManager.isInteractive() && !KeyguardManager.isKeyguardLocked().
+// Sessão ainda aberta: NÃO é persistida como fechada; a UI usa TrustedClock.now()
+// se PowerManager.isInteractive() && !KeyguardManager.isKeyguardLocked().
 ```
 
 Regras de borda:
@@ -293,31 +450,39 @@ Regras de borda:
 - **Toques fantasmas de 1–2 s** (tela acende e apaga) já ficam de fora, porque sem
   desbloqueio não há sessão. Sessões desbloqueadas curtas são mantidas e contam como
   desbloqueio.
+- A sessão herda a **pior `time_quality`** dos eventos que a abrem e fecham.
 
 ---
 
-## 7. Divisão por data (o "dia")
+## 8. Divisão por data (o "dia")
 
-1. Cada sessão é **cortada nas meias-noites locais** que atravessa: uma sessão das 23:50 às
+1. Base: **hora real** (`ts_utc_ms`, Seção 3). A data nunca vem do relógio do aparelho.
+2. Cada sessão é **cortada nas meias-noites locais** que atravessa: uma sessão das 23:50 às
    00:20 dá 10 min a um dia e 20 min ao seguinte.
-2. Fuso usado = o vigente no instante (`zone_history`), calculado com `java.time.ZonedDateTime`.
-   Isso cobre o **horário de verão** (dias de 23 h/25 h; o Brasil não tem desde 2019, mas
-   o código deve suportar) e **viagens** (um dia pode ter duração diferente; o dia recebe
-   uma flag).
-3. **Desbloqueios** são contados no dia em que a sessão **começou**.
-4. **Corte do dia configurável** (padrão 00:00; opcional, ex.: 04:00, para quem dorme
+3. **Fuso de referência** (decisão D8):
+   - Padrão: **fuso fixo** definido na instalação (ex.: `America/Sao_Paulo`), editável nos
+     Ajustes. Mudar o fuso do aparelho não altera em que dia o uso cai.
+   - Opção "seguir o fuso do aparelho" (para quem viaja): usa o `zone_history`. Um dia pode
+     ter duração diferente e recebe uma flag.
+   - As regras de horário de verão vêm do banco tz do sistema (`java.time`), atualizado pelo
+     próprio Android. Dias de 23 h/25 h são suportados (o Brasil não tem horário de verão
+     desde 2019, mas o código deve tratar o caso).
+4. **Desbloqueios** são contados no dia em que a sessão **começou**.
+5. **Corte do dia configurável** (padrão 00:00; opcional, ex.: 04:00, para quem dorme
    tarde — decisão D2).
-5. `hourly_bucket` é preenchido com a mesma lógica de corte, por hora.
+6. `hourly_bucket` é preenchido com a mesma lógica de corte, por hora.
+7. Sessões com **erro de hora** que possa mudar o dia (|erro| maior que a distância até a
+   meia-noite) recebem a flag `BOUNDARY_UNCERTAIN`; raro com fontes 1–3.
 
 ---
 
-## 8. Cobertura e qualidade de cada dia (base para médias corretas)
+## 9. Cobertura e qualidade de cada dia (base para médias corretas)
 
 Diferenciar **"usou 0 min"** de **"não sabemos"** é o ponto que mais afeta a precisão das
 médias.
 
-- **Tempo observado** = união dos intervalos `[query_begin_efetivo, query_end]` dos
-  `ingest_run` bem-sucedidos, onde `query_begin_efetivo = max(query_begin, run_time − 7 dias)`,
+- **Tempo observado** = união dos intervalos de consulta dos `ingest_run` bem-sucedidos
+  (convertidos para hora real), com início efetivo em `max(query_begin, run_time − 7 dias)`,
   menos os períodos com a permissão revogada.
 - Status do dia:
   - **COMPLETE**: o dia inteiro está dentro do tempo observado.
@@ -325,6 +490,9 @@ médias.
     do dia, ou perda após desligamento abrupto (> 0 min estimados).
   - **GAP**: dados expiraram antes de serem copiados (ficou sem ingestão por mais de 7–10 dias).
   - **NO_DATA**: nenhum dado.
+- **Qualidade da hora do dia** = pior `time_quality` entre suas sessões. Um dia com hora
+  `NAO_VERIFICADA` entra nas médias (as durações estão certas), mas aparece sinalizado até a
+  correção retroativa.
 - Telefone **desligado o dia todo** (`DEVICE_SHUTDOWN` sem `STARTUP` no dia) é **COMPLETE
   com 0 min**: o estado é conhecido.
 - **Primeiro dia completo** = o dia seguinte ao do evento mais antigo disponível (o
@@ -334,7 +502,7 @@ médias.
 
 ---
 
-## 9. Estatísticas e médias
+## 10. Estatísticas e médias
 
 Regras gerais:
 - **Por padrão só dias COMPLETE entram nas médias** (decisão D3). Sempre mostrar o
@@ -343,6 +511,7 @@ Regras gerais:
   mês é a soma dos minutos dividida pelo número de dias completos, não a média das médias
   semanais.
 - Guardar em ms e arredondar apenas na exibição (`h:mm`).
+- "Hoje", "esta semana" e "este mês" são definidos pela **data real** (`TrustedClock`).
 
 | Estatística | Fórmula / uso |
 |---|---|
@@ -367,10 +536,11 @@ comparado à curva acumulada típica — nunca misturado nas médias.
 
 ---
 
-## 10. Validação da precisão
+## 11. Validação da precisão
 
-### 10.1 Testes unitários do `:core` (JVM, sem dispositivo)
-Sequências sintéticas com resultado esperado exato (*golden tests*):
+### 11.1 Testes unitários do `:core` (JVM, sem dispositivo)
+Sequências sintéticas com resultado esperado exato (*golden tests*), com relógio do
+aparelho e relógio real **simulados separadamente**:
 1. Desbloqueio simples → bloqueio.
 2. Tela acende por notificação, sem desbloquear → 0.
 3. Bloqueio com atraso: `NON_INTERACTIVE` antes de `KEYGUARD_SHOWN`.
@@ -379,32 +549,47 @@ Sequências sintéticas com resultado esperado exato (*golden tests*):
 6. Câmera pela tela de bloqueio (keyguard continua mostrado).
 7. Sessão cruzando a meia-noite; sessão cruzando duas meias-noites.
 8. Horário de verão (ex.: `America/New_York` e `America/Sao_Paulo` em 2018): dias de 23 h e 25 h.
-9. Viagem com troca de fuso no meio de uma sessão.
-10. Ajuste manual de relógio (+1 h / −1 h) com deslocamento do histórico.
-11. Reboot normal e desligamento abrupto (`DEVICE_SHUTDOWN` sintético).
-12. Eventos duplicados, fora de ordem e com timestamps iguais.
-13. Lacuna de retenção (ingestão após 12 dias) → dias `GAP`.
-14. Permissão revogada e concedida novamente.
-15. Estatísticas: média, mediana, IC e exclusão de dias parciais conferidas contra
+9. Viagem com troca de fuso no meio de uma sessão (modo "seguir o aparelho") e o mesmo caso
+   com fuso fixo.
+10. Ajuste manual de relógio (+1 h / −1 h / +1 dia) com deslocamento do histórico do sistema
+    → o uso continua no dia real.
+11. **Relógio do aparelho 5 min atrasado** perto da meia-noite → sessão contada no dia real
+    (exemplo 3.7).
+12. **Sem internet desde o boot** → eventos `NAO_VERIFICADA`; ao sincronizar, reconversão
+    retroativa somente da mesma época.
+13. Fontes de hora divergentes (TrustedTime × SNTP > 2 s) → escolhe a de menor erro e
+    registra a divergência.
+14. Cálculo SNTP: desvio/RTT com respostas sintéticas; rejeição de `stratum 0`, KoD e `leap = 3`.
+15. Reboot normal e desligamento abrupto (`DEVICE_SHUTDOWN` sintético).
+16. Eventos duplicados, fora de ordem e com timestamps iguais.
+17. Lacuna de retenção (ingestão após 12 dias) → dias `GAP`.
+18. Permissão revogada e concedida novamente.
+19. Estatísticas: média, mediana, IC e exclusão de dias parciais conferidas contra
     valores calculados à mão.
 
-### 10.2 Validação em aparelho real (somente quando você autorizar)
+### 11.2 Validação em aparelho real (somente quando você autorizar)
 - Protocolo de cronômetro: 10 sessões roteirizadas de durações conhecidas. Meta de
   **erro ≤ 1 s por sessão e ≤ 1 min por dia**.
+- Teste de relógio: desligar a "data e hora automáticas", atrasar/adiantar o relógio e
+  conferir que datas e horas exibidas continuam iguais às da internet (erro ≤ 1 s).
 - Comparar os eventos lidos com `adb shell dumpsys usagestats`.
 - Comparar com o Bem-estar Digital e documentar a diferença esperada (foreground × dispositivo).
-- Matriz de aparelhos: Pixel (AOSP), Samsung (One UI), Xiaomi (HyperOS), Motorola —
-  confirmar que os eventos 15–18 e 26–27 existem em cada um.
+- Matriz de aparelhos: Pixel (AOSP), Samsung (One UI), Xiaomi (HyperOS), Motorola e um sem
+  Play services — confirmar os eventos 15–18 e 26–27 e as fontes de hora.
 
 ---
 
-## 11. Permissões, privacidade e Play Store
+## 12. Permissões, privacidade e Play Store
 
 - Manifest: `PACKAGE_USAGE_STATS` (com `tools:ignore="ProtectedPermissions"`),
-  `RECEIVE_BOOT_COMPLETED`. **Sem permissão de INTERNET**: os dados nunca saem do aparelho.
-- **Onboarding com divulgação clara** (o que é coletado, por quê, que fica só no aparelho)
-  **antes** de abrir `Settings.ACTION_USAGE_ACCESS_SETTINGS` (tentar abrir direto na página
-  do app com `package:`; se o fabricante não suportar, abrir a lista).
+  `RECEIVE_BOOT_COMPLETED`, **`INTERNET`** e **`ACCESS_NETWORK_STATE`**.
+- **A internet é usada só para obter a hora** (TrustedTime, NTP.br/`time.google.com` e
+  cabeçalho `Date`). **Nenhum dado de uso sai do aparelho.** Na seção "Segurança dos dados"
+  da Play Store: nenhum dado coletado ou compartilhado.
+- **Onboarding com divulgação clara** (o que é coletado, por quê, que fica só no aparelho e
+  que a internet serve apenas para acertar a hora) **antes** de abrir
+  `Settings.ACTION_USAGE_ACCESS_SETTINGS` (tentar abrir direto na página do app com
+  `package:`; se o fabricante não suportar, abrir a lista).
 - Verificar a permissão a cada abertura/ingestão. Se for revogada: aviso persistente e
   registro da lacuna.
 - Não pedir isenção de otimização de bateria: não é necessária, porque os dados são
@@ -413,41 +598,48 @@ Sequências sintéticas com resultado esperado exato (*golden tests*):
 
 ---
 
-## 12. Interface (resumo)
+## 13. Interface (resumo)
 
-1. **Hoje**: TTD até agora (atualizado ao vivo), desbloqueios, sessão atual e comparação
-   com a curva típica.
+1. **Hoje**: TTD até agora (atualizado ao vivo), desbloqueios, sessão atual, comparação
+   com a curva típica, **data/hora oficial da internet** e aviso se o relógio do aparelho
+   estiver errado.
 2. **Histórico**: calendário/lista por data com o status do dia (completo/parcial/lacuna)
    e gráfico de barras dos últimos 30 dias com a média móvel.
 3. **Médias**: média, mediana, desvio, IC, dias úteis × fim de semana, por dia da semana
    e tendência — sempre com o n de dias.
-4. **Qualidade dos dados**: cobertura, sessões longas, reboots abruptos, mudanças de relógio/fuso.
-5. **Ajustes**: corte do dia, inclusão de dias parciais e exportação.
+4. **Qualidade dos dados**: cobertura, sessões longas, reboots abruptos, mudanças de
+   relógio/fuso, **última sincronização da hora** (fonte, erro estimado, desvio do aparelho).
+5. **Ajustes**: corte do dia, fuso de referência, inclusão de dias parciais e exportação.
 6. (Depois) Widget, metas diárias e detalhamento por app.
 
 ---
 
-## 13. Fases de implementação
+## 14. Fases de implementação
 
 | Fase | Entrega | Critério de pronto |
 |---|---|---|
-| **0 — Spike** | tela de debug que lista os eventos brutos dos últimos dias | eventos 15–18/26–27 confirmados no aparelho-alvo |
-| **1 — Núcleo** | módulo `:core`: Sessionizer, DaySplitter, Coverage e StatsEngine | todos os testes da Seção 10.1 passando |
-| **2 — Dados** | Room, UsageEventSource, workers, receivers e âncora de relógio | ingestão idempotente; backfill de ~10 dias |
+| **0 — Spike** | tela de debug que lista os eventos brutos dos últimos dias e a hora de cada fonte da internet | eventos 15–18/26–27 e ao menos uma fonte de hora confirmados no aparelho-alvo |
+| **1 — Núcleo** | módulo `:core`: TrustedClock, SntpMath, Sessionizer, DaySplitter, Coverage e StatsEngine | todos os testes da Seção 11.1 passando |
+| **2 — Dados** | Room, UsageEventSource, fontes de hora, workers, receivers | ingestão idempotente; backfill de ~10 dias convertido para hora real |
 | **3 — UI** | onboarding, Hoje, Histórico, Médias e Qualidade | fluxo completo sem crash; permissão tratada |
-| **4 — Validação** | protocolo de cronômetro + comparação com dumpsys | erro dentro da meta |
+| **4 — Validação** | protocolo de cronômetro, teste de relógio alterado e comparação com dumpsys | erro dentro da meta |
 | **5 — Extras** | widget, exportação, metas, detalhamento por app | — |
 
 ---
 
-## 14. Riscos e mitigações
+## 15. Riscos e mitigações
 
 | Risco | Mitigação |
 |---|---|
 | Eventos expiram (≈10 dias) | ingestão periódica + no boot + ao abrir; margem de 7 dias; status `GAP` explícito |
 | Fabricante encerra o app/WorkManager | dados retroativos; recuperação ao abrir; alerta de última ingestão |
 | Queda abrupta perde até 20 min | flag `ESTIMATED_END`; dia marcado como parcial |
-| Mudança de relógio desloca o histórico do sistema | âncora `elapsedRealtime`/`BOOT_COUNT`, ajuste da marca d'água, flag `TIME_CHANGED` |
+| Relógio do aparelho errado ou alterado | hora real pela internet (Seção 3); conversão de todos os eventos; aviso na UI |
+| Sem internet por muito tempo | último desvio da mesma época; marca `NAO_VERIFICADA`; correção retroativa ao reconectar |
+| Sem Play services (TrustedTime indisponível) | `currentNetworkTimeClock()` (API 33+), SNTP NTP.br e cabeçalho HTTPS `Date` |
+| Rede bloqueia UDP 123 (NTP) | fallback para TrustedTime e HTTPS `Date` |
+| Servidor de hora falso/manipulado (NTP não autenticado) | verificação cruzada entre fontes; preferência por TrustedTime e HTTPS; descarta divergências > 2 s |
+| Mudança de relógio desloca o histórico do sistema | âncora `elapsedRealtime`/`BOOT_COUNT`, épocas de relógio, ajuste da marca d'água, flag `TIME_CHANGED` |
 | Fabricante com eventos de keyguard diferentes | Fase 0 em vários aparelhos; fallback "sem keyguard" |
 | Permissão revogada | checagem a cada execução, `permission_log`, aviso na UI |
 | Usuário troca de aparelho | histórico antigo só existe no nosso banco → exportação e Auto Backup |
@@ -455,7 +647,7 @@ Sequências sintéticas com resultado esperado exato (*golden tests*):
 
 ---
 
-## 15. Decisões em aberto (com padrão recomendado)
+## 16. Decisões em aberto (com padrão recomendado)
 
 | # | Decisão | Padrão recomendado |
 |---|---|---|
@@ -466,10 +658,12 @@ Sequências sintéticas com resultado esperado exato (*golden tests*):
 | D5 | Uso pela tela de bloqueio (câmera, chamada) | **Não conta** |
 | D6 | Descontar a "cauda" até a tela apagar por inatividade | **Não** (é tempo de tela desbloqueada); pode virar métrica opcional de "tempo ocioso estimado" |
 | D7 | Detalhamento por app já na 1ª versão? | **Não**; Fase 5 |
+| D8 | Fuso para definir o dia | **Fuso fixo de referência** (definido na instalação, ex.: `America/Sao_Paulo`); opção "seguir o fuso do aparelho" para viagens |
+| D9 | Fonte de hora principal | **TrustedTime** (Google), com fallback para `currentNetworkTimeClock()`, **NTP.br** e HTTPS `Date` |
 
 ---
 
-## 16. Fontes consultadas
+## 17. Fontes consultadas
 
 - Android Developers — [`UsageEvents.Event`](https://developer.android.com/reference/android/app/usage/UsageEvents.Event)
   (constantes, níveis de API e semântica de `DEVICE_SHUTDOWN/STARTUP`).
@@ -477,8 +671,19 @@ Sequências sintéticas com resultado esperado exato (*golden tests*):
   (retenção de "alguns dias", permissão, `queryEventsForSelf`, retorno vazio antes do desbloqueio).
 - Android Developers — [`UsageEventsQuery.Builder`](https://developer.android.com/reference/android/app/usage/UsageEventsQuery.Builder) (API 35).
 - Android Developers — [Exceções de broadcasts implícitos](https://developer.android.com/develop/background-work/background-tasks/broadcasts/broadcast-exceptions).
+- Android Developers — [`SystemClock`](https://developer.android.com/reference/android/os/SystemClock)
+  (`currentNetworkTimeClock()` API 33, `elapsedRealtime`, relógios do sistema).
+- Android Developers Blog — [TrustedTime API: introducing a reliable approach to time keeping for apps](https://android-developers.googleblog.com/2025/02/trustedtime-api-introducing-reliable-approach-to-time-keeping-for-apps.html).
+- Google Play services — [`TrustedTimeClient`](https://developers.google.com/android/reference/com/google/android/gms/time/TrustedTimeClient),
+  [`TimeSignal`](https://developers.google.com/android/reference/com/google/android/gms/time/trustedtime/TimeSignal),
+  [`ComputedInstant`](https://developers.google.com/android/reference/com/google/android/gms/time/trustedtime/ComputedInstant)
+  e [Play Services Time API](https://developers.google.com/location-context/time).
+- NTP.br / NIC.br — [Apresentação NTP.br, IX Fórum Fortaleza 2026](https://fortaleza.forum.ix.br/files/apresentacao/arquivo/2460/02-ApresentacaoNTP.br-IXForumFortaleza2026.pdf)
+  (servidores stratum 1 `a–e.st1.ntp.br`, Hora Legal Brasileira, NTS) e
+  [NTP Pool — NIC.br](https://www.ntppool.org/a/ntpbr).
 - AOSP `frameworks/base` (branch `main`):
-  `services/usage/.../UsageStatsService.java` (flush a cada 20 min, correção de relógio),
+  `services/usage/.../UsageStatsService.java` (flush a cada 20 min, correção de relógio,
+  conversão `elapsedRealtime` → relógio do aparelho),
   `UserUsageStatsService.java` (`DEVICE_SHUTDOWN` sintético, rollover diário),
   `UsageStatsDatabase.java` (retenção de 10 dias, `onTimeChanged`),
   `IntervalStats.java` (trackers de `EventStats`),
