@@ -16,8 +16,11 @@ class CoverageAndIngestionTest {
 
     @Test
     fun mesclaIntervalos() {
-        val merged = Coverage.merge(listOf(Interval(10, 20), Interval(0, 12), Interval(30, 40), Interval(40, 50)))
-        assertEquals(listOf(Interval(0, 20), Interval(30, 50)), merged)
+        // Intervalos separados por até 1 s são unidos; lacunas maiores são preservadas.
+        val merged = Coverage.merge(
+            listOf(Interval(10_000, 20_000), Interval(0, 12_000), Interval(30_000, 40_000), Interval(40_500, 50_000)),
+        )
+        assertEquals(listOf(Interval(0, 20_000), Interval(30_000, 50_000)), merged)
     }
 
     @Test

@@ -34,14 +34,12 @@ jobs:
       - name: Permissão do gradlew
         run: chmod +x gradlew
 
-      - name: Testes do núcleo (:core)
-        run: ./gradlew --stacktrace :core:test
-
-      - name: Compilar APK (debug e release)
-        run: ./gradlew --stacktrace :app:assembleDebug :app:assembleRelease
+      - name: Testes do núcleo e compilação dos APKs
+        # --continue: mesmo se um teste falhar, a compilação do app roda e todos os erros aparecem.
+        run: ./gradlew --continue :core:test :app:assembleDebug :app:assembleRelease
 
       - name: Publicar APKs
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: tempo-de-tela-apk
           path: app/build/outputs/apk/**/*.apk
@@ -49,7 +47,7 @@ jobs:
 
       - name: Relatório dos testes (em caso de falha)
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: relatorio-testes
           path: core/build/reports/tests/
