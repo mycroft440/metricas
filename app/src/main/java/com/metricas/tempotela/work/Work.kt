@@ -134,6 +134,9 @@ object Scheduler {
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+        // Cria logo no início do boot a âncora estimada da hora, presa ao relógio monotônico:
+        // mudanças de relógio feitas depois disso não afetam a hora do app, mesmo sem internet.
+        context.graph.clock.read()
         Scheduler.ensureScheduled(context)
         Scheduler.syncNow(context, "boot")
         Scheduler.ingestNow(context, "boot")

@@ -14,6 +14,9 @@ object SessionFlags {
     const val ESTIMATED_END = 2
     const val OPEN = 4
 
+    /** Marca de dia: os totais violaram uma checagem de consistência (ver Invariants). */
+    const val INCONSISTENT = 8
+
     fun has(flags: Int, flag: Int): Boolean = (flags and flag) != 0
 }
 
@@ -35,6 +38,8 @@ data class SessionizerResult(
     val screenOn: List<Interval>,
     val openSession: Session?,
     val openScreenOnStartUtc: Long?,
+    /** O trecho mais recente (desde o último boot) foi tratado como aparelho sem tela de bloqueio. */
+    val lastSegmentNoKeyguard: Boolean = false,
 )
 
 /**
@@ -45,18 +50,52 @@ data class SessionizerResult(
 class Sessionizer(private val config: Config = Config()) {
 
     data class Config(
-        /** Aparelho sem tela de bloqueio: o sistema nunca emite eventos de keyguard. */
-        val noKeyguard: Boolean = false,
+        /**
+         * Indício de que o aparelho não tem tela de bloqueio (ex.: `isDeviceSecure == false`).
+         * A decisão final é feita por trecho entre boots: sem nenhum evento de keyguard no
+         * trecho e com o indício (ou com várias ligações de tela), o trecho é tratado como
+         * "sem bloqueio". Assim, trocar o tipo de bloqueio no meio do histórico não zera dias.
+         */
+        val noKeyguardHint: Boolean = false,
         val longSessionMs: Long = 3L * 60 * 60 * 1000,
+        /** Ligações de tela sem nenhum evento de keyguard para concluir "sem bloqueio". */
+        val minScreenOnsForNoKeyguard: Int = 3,
     )
+
+    /** Decide, para cada trecho entre DEVICE_STARTUPs, se o aparelho estava sem bloqueio. */
+    private fun segmentNoKeyguard(sorted: List<UsageEvent>): List<Boolean> {
+        val result = ArrayList<Boolean>()
+        var keyguardEvents = 0
+        var screenOns = 0
+        fun close() {
+            result += keyguardEvents == 0 &&
+                (config.noKeyguardHint || screenOns >= config.minScreenOnsForNoKeyguard)
+        }
+        for (e in sorted) {
+            when (e.type) {
+                EventType.DEVICE_STARTUP -> {
+                    close()
+                    keyguardEvents = 0
+                    screenOns = 0
+                }
+                EventType.KEYGUARD_SHOWN, EventType.KEYGUARD_HIDDEN -> keyguardEvents++
+                EventType.SCREEN_INTERACTIVE -> screenOns++
+            }
+        }
+        close()
+        return result
+    }
 
     fun run(events: List<UsageEvent>, nowUtc: Long? = null): SessionizerResult {
         val sorted = events.sortedWith(compareBy<UsageEvent>({ it.tsUtc }, { it.seq }))
         val sessions = ArrayList<Session>()
         val screenOn = ArrayList<Interval>()
+        val noKeyguardBySegment = segmentNoKeyguard(sorted)
+        var segment = 0
+        var noKeyguard = noKeyguardBySegment[0]
 
         var interactive: Boolean? = null
-        var keyguardShown: Boolean? = if (config.noKeyguard) false else null
+        var keyguardShown: Boolean? = if (noKeyguard) false else null
         var openStart: Long? = null
         var openReason = StartReason.UNLOCK
         var openQuality = TimeQuality.VERIFICADA
@@ -86,15 +125,17 @@ class Sessionizer(private val config: Config = Config()) {
                     closeSession(e.tsUtc, EndReason.SHUTDOWN, e.quality, SessionFlags.ESTIMATED_END)
                     closeScreenOn(e.tsUtc)
                     interactive = null
-                    keyguardShown = if (config.noKeyguard) false else null
+                    keyguardShown = if (noKeyguard) false else null
                     continue
                 }
                 EventType.DEVICE_STARTUP -> {
                     // Algo aberto sem DEVICE_SHUTDOWN tem fim desconhecido: é descartado.
+                    segment++
+                    noKeyguard = noKeyguardBySegment.getOrElse(segment) { noKeyguard }
                     openStart = null
                     screenOnStart = null
                     interactive = null
-                    keyguardShown = !config.noKeyguard
+                    keyguardShown = !noKeyguard
                     continue
                 }
             }
@@ -109,7 +150,7 @@ class Sessionizer(private val config: Config = Config()) {
                     interactive = false
                     closeScreenOn(e.tsUtc)
                 }
-                EventType.KEYGUARD_SHOWN -> if (!config.noKeyguard) keyguardShown = true
+                EventType.KEYGUARD_SHOWN -> if (!noKeyguard) keyguardShown = true
                 EventType.KEYGUARD_HIDDEN -> {
                     keyguardShown = false
                     // Só é possível desbloquear com a tela ligada.
@@ -138,6 +179,6 @@ class Sessionizer(private val config: Config = Config()) {
             if (end - start > config.longSessionMs) flags = flags or SessionFlags.LONG
             Session(start, end, openReason, null, flags, openQuality)
         }
-        return SessionizerResult(sessions, screenOn, open, screenOnStart)
+        return SessionizerResult(sessions, screenOn, open, screenOnStart, noKeyguard)
     }
 }

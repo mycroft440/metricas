@@ -36,7 +36,7 @@ class AppGraph(context: Context) {
     val epochs = ClockEpochTracker(appContext, db)
     val timeSources = NetworkTimeSources(appContext)
     val syncer = TimeSyncer(appContext, db, clock, epochs, timeSources)
-    val corrector = TimeCorrector(db, clock)
+    val corrector = TimeCorrector(db, clock, settings)
     val usage = UsageEventSource(appContext)
     val ingestor = Ingestor(appContext, db, settings, clock, epochs, usage)
     val recomputer = Recomputer(appContext, db, settings, clock)

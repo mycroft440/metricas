@@ -18,7 +18,12 @@ import com.metricas.tempotela.graph
 import com.metricas.tempotela.pipeline.LiveState
 import com.metricas.tempotela.platform.UsageAccess
 import com.metricas.tempotela.time.SyncOutcome
-import com.metricas.tempotela.time.TrustedClock
+import com.metricas.core.time.ClockReading
+import com.metricas.core.ingest.Observation
+import com.metricas.core.model.EventType
+import com.metricas.core.model.Interval
+import com.metricas.core.model.TimeQuality
+import com.metricas.tempotela.platform.BackgroundProtection
 import com.metricas.tempotela.time.label
 import com.metricas.tempotela.work.Scheduler
 import kotlinx.coroutines.Dispatchers
@@ -64,13 +69,20 @@ data class QualityInfo(
     val estimatedEndDays: Int,
     val firstEventUtc: Long?,
     val statusCounts: Map<String, Int>,
+    val eventTypeCounts7d: Map<Int, Int>,
+    val largestIngestGapMs30d: Long,
+    val inconsistentDays: Int,
+    val unusedAppRestrictions: Boolean,
+    val batteryOptimized: Boolean,
+    /** Avisos que exigem atenção do usuário para manter as medições corretas. */
+    val alerts: List<String>,
 )
 
 data class UiState(
     val hasUsageAccess: Boolean = false,
     val checkedAccess: Boolean = false,
     val busy: Boolean = false,
-    val clock: TrustedClock.Reading? = null,
+    val clock: ClockReading? = null,
     val zone: ZoneId = ZoneId.systemDefault(),
     val live: LiveState? = null,
     val days: List<DailySummaryEntity> = emptyList(),
@@ -105,7 +117,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private fun currentZone(): ZoneId =
         if (graph.settings.followDeviceZone) ZoneId.systemDefault() else graph.settings.referenceZone()
 
-    /** Executa enquanto a tela está visível: relógio a cada 1 s, atualização a cada 60 s. */
+    /** Executa enquanto a tela está visível: relógio a cada 1 s, nova leitura a cada 5 min. */
     suspend fun runWhileVisible() {
         refresh(forceSync = false)
         var ticks = 0
@@ -117,7 +129,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val zone = currentZone()
             val dayChanged = live != null &&
                 DayResolver({ zone }, graph.settings.dayCutoffHour).dayOf(graph.clock.now()) != live.today
-            if (ticks >= 60 || dayChanged) {
+            if (ticks >= REFRESH_EVERY_S || dayChanged) {
                 ticks = 0
                 refresh(forceSync = false)
             }
@@ -286,12 +298,49 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         val syncs = db.timeSyncDao().recent(8)
+        val now = reading.trueNowUtc
+        val typeCounts = db.rawEventDao().countsByTypeSince(now - 7 * DAY_MS).associate { it.type to it.n }
+        val recentRuns = db.ingestRunDao().okRuns()
+            .filter { it.observedEndUtc >= now - 30 * DAY_MS }
+            .map { Interval(it.observedStartUtc, it.observedEndUtc) }
+        val largestGap = Observation.largestGapMs(recentRuns)
+        val inconsistentDays = days.count { SessionFlags.has(it.qualityFlags, SessionFlags.INCONSISTENT) }
+        val gapDays30 = days.count {
+            it.status == "GAP" && !LocalDate.parse(it.date).isBefore(today.minusDays(30))
+        }
+        val unusedRestrictions = BackgroundProtection.unusedAppRestrictionsEnabled(getApplication<Application>())
+        val batteryOptimized = BackgroundProtection.batteryOptimized(getApplication<Application>())
+        val eventCount = db.rawEventDao().count()
+
+        val alerts = buildList {
+            if (eventCount > 0 && (typeCounts[EventType.SCREEN_INTERACTIVE] ?: 0) == 0) {
+                add(
+                    "Nenhum evento de tela ligada nos últimos 7 dias. Este aparelho pode não registrar " +
+                        "esses eventos e as medições podem ficar zeradas.",
+                )
+            }
+            if (reading.quality != TimeQuality.VERIFICADA) {
+                add("Hora ainda não verificada pela internet. Conecte-se: os horários serão corrigidos automaticamente.")
+            }
+            if (largestGap > 4 * DAY_MS) {
+                add(
+                    "O app ficou ${largestGap / DAY_MS} dias sem coletar em segundo plano. O Android guarda " +
+                        "os eventos por ~10 dias: desative as restrições em Ajustes → Proteções.",
+                )
+            }
+            if (unusedRestrictions) {
+                add("\"Pausar atividade do app se não usado\" está ativo e pode interromper a coleta. Veja Ajustes → Proteções.")
+            }
+            if (gapDays30 > 0) add("$gapDays30 dia(s) com lacuna de dados nos últimos 30 dias.")
+            if (inconsistentDays > 0) add("$inconsistentDays dia(s) com inconsistência detectada. Veja a aba Qualidade.")
+        }
+
         val quality = QualityInfo(
             lastSync = db.timeSyncDao().latestChosen(),
             recentSyncs = syncs,
             lastIngest = db.ingestRunDao().last(),
             okIngests = db.ingestRunDao().okCount(),
-            eventCount = db.rawEventDao().count(),
+            eventCount = eventCount,
             unverifiedEvents = db.rawEventDao().unverifiedCount(),
             epochCount = db.clockEpochDao().count(),
             clockEvents = db.clockEventDao().recent(10),
@@ -299,6 +348,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             estimatedEndDays = days.count { SessionFlags.has(it.qualityFlags, SessionFlags.ESTIMATED_END) },
             firstEventUtc = db.rawEventDao().minTsUtc(),
             statusCounts = days.groupingBy { it.status }.eachCount(),
+            eventTypeCounts7d = typeCounts,
+            largestIngestGapMs30d = largestGap,
+            inconsistentDays = inconsistentDays,
+            unusedAppRestrictions = unusedRestrictions,
+            batteryOptimized = batteryOptimized,
+            alerts = alerts,
         )
 
         _state.update {
@@ -354,12 +409,34 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
-    /** Tempo desbloqueado de hoje, incluindo a sessão em andamento até agora. */
+    /**
+     * Tempo desbloqueado de hoje, incluindo a sessão em andamento até agora. Só extrapola
+     * se o último cálculo é recente: um estado antigo nunca infla o contador.
+     */
     fun liveUnlockedMs(s: UiState): Long {
         val live = s.live ?: return 0
         val now = s.clock?.trueNowUtc ?: return live.todayUnlockedMs
-        val extra = if (live.openSessionStartUtc != null) (now - live.computedAtUtc).coerceAtLeast(0) else 0
+        val elapsed = now - live.computedAtUtc
+        val extra = if (live.openSessionStartUtc != null && elapsed in 0..MAX_EXTRAPOLATION_MS) elapsed else 0L
         return live.todayUnlockedMs + extra
+    }
+
+    fun openUnusedAppSettings() = launchSettings(BackgroundProtection.unusedAppRestrictionsIntent(getApplication<Application>()))
+
+    fun openBatterySettings() = launchSettings(BackgroundProtection.batterySettingsIntent())
+
+    private fun launchSettings(intent: android.content.Intent) {
+        try {
+            getApplication<Application>().startActivity(intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (e: Exception) {
+            _state.update { it.copy(message = "Não foi possível abrir as configurações neste aparelho") }
+        }
+    }
+
+    private companion object {
+        const val DAY_MS = 86_400_000L
+        const val REFRESH_EVERY_S = 300
+        const val MAX_EXTRAPOLATION_MS = 10L * 60 * 1000
     }
 
     fun qualityLabel(s: UiState): String = s.clock?.quality?.label() ?: "-"

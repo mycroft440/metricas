@@ -1,10 +1,13 @@
 package com.metricas.tempotela.pipeline
 
 import android.content.Context
+import android.util.Log
 import androidx.room.withTransaction
 import com.metricas.core.coverage.Coverage
 import com.metricas.core.day.DayAggregator
 import com.metricas.core.day.DayResolver
+import com.metricas.core.day.Invariants
+import com.metricas.core.session.SessionFlags
 import com.metricas.core.model.Interval
 import com.metricas.core.model.TimeQuality
 import com.metricas.core.model.UsageEvent
@@ -71,12 +74,16 @@ class Recomputer(
 
     private suspend fun recomputeLocked(affectedFromUtc: Long?): LiveState? {
         val now = clock.now()
+        // Só conhecemos os eventos até a última leitura. Uma sessão ainda aberta é estendida
+        // até esse ponto, nunca até "agora": se o recálculo rodar sem ingestão (ex.: após uma
+        // sincronização de hora), o tempo com a tela já apagada não é contado.
+        val knownUntil = minOf(now, settings.watermarkUtc ?: now)
         val resolver = resolver()
         val today = resolver.dayOf(now)
         val minEvent = db.rawEventDao().minTsUtc() ?: return null
         val firstDay = resolver.dayOf(minEvent)
 
-        val full = settings.needsFullRecompute
+        val full = settings.needsFullRecompute || settings.algoVersion != ALGO_VERSION
         var fromDay = if (full) firstDay else today.minusDays(1)
         if (!full && affectedFromUtc != null) {
             val affectedDay = resolver.dayOf(affectedFromUtc)
@@ -90,12 +97,13 @@ class Recomputer(
         val events = db.rawEventDao().eventsFrom(warmupStart).map {
             UsageEvent(it.tsUtc, it.type, it.id, TimeQuality.parse(it.quality))
         }
-        val noKeyguard = db.rawEventDao().keyguardEventCount() == 0 && !DeviceState.isDeviceSecure(context)
+        val noKeyguardHint = !DeviceState.isDeviceSecure(context)
 
-        val result = Sessionizer(Sessionizer.Config(noKeyguard = noKeyguard)).run(events, now)
+        val result = Sessionizer(Sessionizer.Config(noKeyguardHint = noKeyguardHint)).run(events, knownUntil)
         val allSessions = result.sessions + listOfNotNull(result.openSession)
         val screenOn = result.screenOn +
-            listOfNotNull(result.openScreenOnStartUtc?.let { Interval(it, maxOf(it, now)) })
+            listOfNotNull(result.openScreenOnStartUtc?.let { Interval(it, maxOf(it, knownUntil)) })
+        val sessionProblems = Invariants.sessionProblems(allSessions)
 
         val aggregates = DayAggregator(resolver).aggregate(allSessions, screenOn, fromDay, today)
         val merged = Coverage.merge(
@@ -104,6 +112,11 @@ class Recomputer(
 
         val summaries = aggregates.map { a ->
             val cov = Coverage.evaluate(a.dayStartUtc, a.dayEndUtc, now, merged)
+            val problems = Invariants.check(a) + sessionProblems
+            if (problems.isNotEmpty()) {
+                a.flags = a.flags or SessionFlags.INCONSISTENT
+                Log.w(TAG, "Dia ${a.date} inconsistente: ${problems.joinToString()}")
+            }
             DailySummaryEntity(
                 date = a.date.toString(),
                 zoneId = a.zoneId,
@@ -132,7 +145,7 @@ class Recomputer(
                 .filter { a.hourlyMs[it] > 0 || a.hourlyUnlocks[it] > 0 }
                 .map { HourlyBucketEntity(a.date.toString(), it, a.hourlyMs[it], a.hourlyUnlocks[it]) }
         }
-        val sessionsToStore = result.sessions.filter { it.startUtc >= fromStart }.map {
+        val sessionsToStore = result.sessions.filter { it.endUtc >= fromStart }.map {
             SessionEntity(
                 startUtc = it.startUtc,
                 endUtc = it.endUtc,
@@ -151,7 +164,7 @@ class Recomputer(
                 db.dailySummaryDao().deleteAll()
                 db.hourlyBucketDao().deleteAll()
             } else {
-                db.sessionDao().deleteFrom(fromStart)
+                db.sessionDao().deleteEndingFrom(fromStart, warmupStart)
                 db.dailySummaryDao().deleteFrom(fromDay.toString())
                 db.hourlyBucketDao().deleteFrom(fromDay.toString())
             }
@@ -159,7 +172,10 @@ class Recomputer(
             if (summaries.isNotEmpty()) db.dailySummaryDao().insertAll(summaries)
             if (hourly.isNotEmpty()) db.hourlyBucketDao().insertAll(hourly)
         }
-        if (full) settings.needsFullRecompute = false
+        if (full) {
+            settings.needsFullRecompute = false
+            settings.algoVersion = ALGO_VERSION
+        }
 
         val todayAgg = aggregates.lastOrNull { it.date == today }
         return LiveState(
@@ -167,14 +183,15 @@ class Recomputer(
             todayUnlockedMs = todayAgg?.unlockedMs ?: 0L,
             todayScreenOnMs = todayAgg?.screenOnMs ?: 0L,
             todayUnlocks = todayAgg?.unlocks ?: 0,
-            computedAtUtc = now,
+            computedAtUtc = knownUntil,
             openSessionStartUtc = result.openSession?.startUtc,
-            noKeyguard = noKeyguard,
+            noKeyguard = result.lastSegmentNoKeyguard,
         )
     }
 
     companion object {
-        const val ALGO_VERSION = 1
+        const val ALGO_VERSION = 2
+        private const val TAG = "Recomputer"
         private const val WARMUP_MS = 36L * 60 * 60 * 1000
     }
 }

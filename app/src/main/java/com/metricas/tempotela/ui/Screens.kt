@@ -108,6 +108,10 @@ fun TodayScreen(state: UiState, vm: MainViewModel) {
     val todayRow = state.days.lastOrNull { live != null && it.date == live.today.toString() }
 
     LazyColumn(contentPadding = screenPadding, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        val alerts = state.quality?.alerts.orEmpty()
+        if (alerts.isNotEmpty()) {
+            item { AlertsCard(alerts) }
+        }
         item {
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -195,7 +199,10 @@ private fun OfficialClockCard(state: UiState) {
     val c = state.clock ?: return
     SectionCard("Hora oficial (internet)") {
         Text(Fmt.timeSec(c.trueNowUtc, state.zone), style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
-        KeyValue("Fonte", c.source?.label ?: "sem sincronização neste boot")
+        KeyValue(
+            "Fonte",
+            c.source?.label ?: if (c.quality == TimeQuality.INFERIDA) "estimada (último desvio conhecido)" else "relógio do aparelho (sem verificação)",
+        )
         c.errorMs?.let { KeyValue("Erro estimado", "±$it ms") }
         KeyValue("Qualidade", c.quality.label())
         KeyValue("Fuso usado", state.zone.id)
@@ -464,6 +471,22 @@ fun QualityScreen(state: UiState, vm: MainViewModel) {
                 }
             }
             item {
+                SectionCard("Diagnóstico") {
+                    for (alert in q.alerts) {
+                        Text("• $alert", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                    }
+                    if (q.alerts.isEmpty()) {
+                        Text("Nenhum problema detectado.", style = MaterialTheme.typography.bodySmall)
+                    }
+                    KeyValue("Maior intervalo sem coleta (30 dias)", Fmt.duration(q.largestIngestGapMs30d))
+                    KeyValue("Dias com inconsistência", q.inconsistentDays.toString())
+                    Text("Eventos registrados nos últimos 7 dias:", style = MaterialTheme.typography.bodySmall)
+                    for (type in com.metricas.core.model.EventType.TRACKED) {
+                        KeyValue(com.metricas.core.model.EventType.label(type), (q.eventTypeCounts7d[type] ?: 0).toString())
+                    }
+                }
+            }
+            item {
                 SectionCard("Dias") {
                     for (status in listOf("COMPLETE", "PARTIAL", "GAP", "NO_DATA")) {
                         KeyValue(Fmt.status(status), (q.statusCounts[status] ?: 0).toString())
@@ -573,6 +596,24 @@ fun SettingsScreen(state: UiState, vm: MainViewModel) {
             }
         }
         item {
+            val q = state.quality
+            SectionCard("Proteções da coleta") {
+                Text(
+                    "O Android guarda os eventos por ~10 dias. Para não perder dados se você ficar dias sem " +
+                        "abrir o app, deixe a coleta em segundo plano livre de restrições.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                if (q != null) {
+                    KeyValue("Pausar app se não usado", if (q.unusedAppRestrictions) "ativado (recomendado desativar)" else "desativado")
+                    KeyValue("Otimização de bateria", if (q.batteryOptimized) "ativada" else "sem restrição")
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { vm.openUnusedAppSettings() }) { Text("Pausa por inatividade") }
+                    OutlinedButton(onClick = { vm.openBatterySettings() }) { Text("Bateria") }
+                }
+            }
+        }
+        item {
             SectionCard("Exportar dados") {
                 Text(
                     "O histórico com mais de 10 dias existe só neste app. Exporte para guardar uma cópia.",
@@ -608,5 +649,21 @@ private fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Un
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Text(label, modifier = Modifier.weight(1f))
         Switch(checked = checked, onCheckedChange = onChange)
+    }
+}
+
+@Composable
+private fun AlertsCard(alerts: List<String>) {
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = androidx.compose.material3.CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer,
+            contentColor = MaterialTheme.colorScheme.onErrorContainer,
+        ),
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Atenção", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            for (alert in alerts) Text("• $alert", style = MaterialTheme.typography.bodySmall)
+        }
     }
 }

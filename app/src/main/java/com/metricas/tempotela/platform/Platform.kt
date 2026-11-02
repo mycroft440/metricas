@@ -13,11 +13,16 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
 import android.os.Process
 import android.os.SystemClock
 import android.os.UserManager
 import android.provider.Settings
 import androidx.annotation.RequiresApi
+import androidx.core.content.IntentCompat
+import androidx.core.content.PackageManagerCompat
+import androidx.core.content.UnusedAppRestrictionsConstants
+import java.util.concurrent.TimeUnit
 import com.metricas.core.ingest.DeviceEvent
 import com.metricas.core.model.EventType
 
@@ -53,14 +58,49 @@ object UsageAccess {
         val direct = Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
             .setData(Uri.parse("package:${context.packageName}"))
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        try {
-            context.startActivity(direct)
-        } catch (e: ActivityNotFoundException) {
-            context.startActivity(
-                Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-            )
+        val list = Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val details = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+            .setData(Uri.parse("package:${context.packageName}"))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        for (intent in listOf(direct, list, details)) {
+            try {
+                context.startActivity(intent)
+                return
+            } catch (e: ActivityNotFoundException) {
+                // tenta a próxima
+            } catch (e: SecurityException) {
+                // tenta a próxima
+            }
         }
     }
+}
+
+/**
+ * Proteções do sistema que podem impedir a coleta em segundo plano. Os eventos ficam no
+ * Android por ~10 dias; se o app ficar pausado por mais que isso, dados são perdidos.
+ */
+object BackgroundProtection {
+    /** "Pausar atividade do app se não usado" ligado (hibernação, Android 11+). */
+    fun unusedAppRestrictionsEnabled(context: Context): Boolean = try {
+        val status = PackageManagerCompat.getUnusedAppRestrictionsStatus(context).get(3, TimeUnit.SECONDS)
+        status == UnusedAppRestrictionsConstants.API_30 ||
+            status == UnusedAppRestrictionsConstants.API_30_BACKPORT ||
+            status == UnusedAppRestrictionsConstants.API_31
+    } catch (e: Exception) {
+        false
+    }
+
+    fun unusedAppRestrictionsIntent(context: Context): Intent =
+        IntentCompat.createManageUnusedAppRestrictionsIntent(context, context.packageName)
+
+    /** O app está sujeito à otimização de bateria (pode atrasar as leituras). */
+    fun batteryOptimized(context: Context): Boolean {
+        val pm = context.getSystemService(PowerManager::class.java) ?: return false
+        return !pm.isIgnoringBatteryOptimizations(context.packageName)
+    }
+
+    fun batterySettingsIntent(): Intent =
+        Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 }
 
 object DeviceState {

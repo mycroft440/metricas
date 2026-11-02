@@ -694,3 +694,31 @@ aparelho e relógio real **simulados separadamente**:
   [Hintze et al., UbiComp 2014](https://ins.jku.at/publications/2014/Hintze_2014_UbiComp.pdf)
   (uso com e sem desbloqueio); [User interaction analysis (Cardiff)](https://orca.cardiff.ac.uk/142395/1/User_interaction_analysis_ARDUOUS_Authors.pdf)
   (ciclos curtos de tela sem interação).
+
+---
+
+## 18. Blindagem (revisão de brechas, bugs e erros)
+
+Revisão feita sobre o código implementado, com a correção aplicada para cada ponto.
+
+| # | Brecha / bug | Efeito antes | Correção |
+|---|---|---|---|
+| B1 | Sessão aberta estendida até "agora" em recálculos sem nova leitura (ex.: após sincronizar a hora) | Somava tempo com a tela já apagada (até horas) | Sessão aberta vai só até o fim da última leitura (`knownUntil`) |
+| B2 | Contador ao vivo extrapolava a partir de estado antigo | Pico falso ao voltar ao app | Extrapolação só se o cálculo tem menos de 10 min |
+| B3 | Escolha da hora por "menor erro" | Um NTP falsificado/quebrado (rede hostil, VPN) definia a hora | Consenso: fonte autenticada (TrustedTime/HTTPS) é a referência; sem ela, vale a maioria; respostas implausíveis descartadas; fonte única não autenticada não é "verificada" |
+| B4 | Sem internet, a hora do app seguia o relógio do aparelho | Mudar o relógio offline deslocava/duplicava eventos | Âncora estimada presa ao relógio monotônico, criada no boot |
+| B5 | Correções pequenas de NTP deslocam o histórico do Android sem abrir "época" nova | Eventos da sobreposição duplicados | Deduplicação também pela hora real (±1,5 s) em qualquer época |
+| B6 | "Sem tela de bloqueio" decidido para o histórico inteiro | Trocar de "Nenhum" para PIN zerava dias antigos no recálculo | Decisão por trecho entre boots |
+| B7 | Sincronização e ingestão podiam se intercalar | Eventos ficavam sem correção retroativa | Um único mutex no pipeline + correção logo após a ingestão |
+| B8 | NTP aceitava servidor com incerteza alta / carimbos fora de ordem | Hora com erro maior que o informado | Valida root delay/dispersion, ordem dos carimbos e RTT máximo; erro inclui a incerteza do servidor |
+| B9 | Cabeçalho HTTP `Date` vindo de cache | Hora antiga | `Cache-Control: no-cache` e compensação do cabeçalho `Age` |
+| B10 | Sessões antigas ficavam desatualizadas após recálculo parcial | Estatísticas de sessão com dados velhos | Recalcula também sessões que terminam na janela |
+| B11 | Erros silenciosos nos totais | Número errado sem aviso | Checagens de consistência por dia (marca `INCONSISTENT`) e sessões sem sobreposição |
+| B12 | App pausado pelo sistema (hibernação/bateria) por > 10 dias | Perda de dados sem aviso | Diagnóstico de "pausar app se não usado", otimização de bateria e maior intervalo sem coleta, com atalhos nos Ajustes |
+| B13 | Aparelho que não registra eventos de tela | Tudo zerado sem explicação | Contagem de eventos por tipo (7 dias) e alerta |
+| B14 | Receivers exportados | Superfície de ataque desnecessária | `exported=false` (broadcasts protegidos chegam do sistema) |
+| B15 | Mudança de algoritmo não recalculava o histórico | Dias antigos com regra antiga | Versão do algoritmo salva; mudança força recálculo completo |
+
+Limitações conhecidas (não resolvíveis só com o app): aparelho com root pode adulterar
+qualquer dado; "forçar parada" ou limpar dados interrompe a coleta; trocar de usuário do
+Android (tablets) não gera evento de tela para o usuário anterior.

@@ -126,10 +126,17 @@ class TimeSyncer(
                 }
             }
 
+            // Fontes locais/baratas primeiro; depois rede. Sempre tenta ter ao menos uma
+            // fonte autenticada (TrustedTime ou HTTPS) para validar NTP, que não é autenticado.
             attempt("TrustedTime") { sources.trustedTime() }
             attempt("Relógio de rede") { sources.networkClock() }
-            if (samples.size < 2 || samples.none { it.errorMs <= 200 }) attempt("NTP") { sources.sntp() }
-            if (samples.size < 2) attempt("HTTPS") { sources.httpsDate() }
+            var ntpTried = false
+            if (samples.none { it.errorMs <= 200 }) {
+                ntpTried = true
+                attempt("NTP") { sources.sntp() }
+            }
+            if (samples.none { it.source.authenticated }) attempt("HTTPS") { sources.httpsDate() }
+            if (samples.size < 2 && !ntpTried) attempt("NTP") { sources.sntp() }
 
             val choice = TimeMath.choose(samples)
             if (choice == null) {
@@ -173,8 +180,12 @@ class TimeSyncer(
                         rttMs = s.rttMs,
                         disagreementMs = if (s === choice.best) choice.disagreementMs else abs(s.elapsedToUtcMs - choice.best.elapsedToUtcMs),
                         chosen = s === choice.best,
-                        ok = true,
-                        error = null,
+                        ok = TimeMath.isPlausible(s) && choice.rejected.none { it === s },
+                        error = when {
+                            !TimeMath.isPlausible(s) -> "descartada: hora implausível"
+                            choice.rejected.any { it === s } -> "descartada: discorda das outras fontes"
+                            else -> null
+                        },
                     ),
                 )
             }
@@ -188,6 +199,7 @@ class TimeSyncer(
                     errorMs = best.errorMs,
                     source = best.source,
                     server = best.server,
+                    corroborated = choice.corroborated,
                 ),
                 best.deviceOffsetMs,
             )
@@ -200,7 +212,11 @@ class TimeSyncer(
  * Correção retroativa (Seção 3.5): quando chega a primeira sincronização de um boot, as
  * ingestões desse boot feitas sem hora verificada são reconvertidas.
  */
-class TimeCorrector(private val db: AppDatabase, private val clock: TrustedClock) {
+class TimeCorrector(
+    private val db: AppDatabase,
+    private val clock: TrustedClock,
+    private val settings: com.metricas.tempotela.data.AppSettings,
+) {
 
     /** @return menor hora real afetada, ou null se nada mudou. */
     suspend fun correctAfterSync(): Long? = withContext(Dispatchers.IO) {
@@ -210,7 +226,7 @@ class TimeCorrector(private val db: AppDatabase, private val clock: TrustedClock
         for (run in runs) {
             val trueAtRun = TimeMath.trueAt(anchor, run.elapsedMs)
             val error = TimeMath.errorAt(anchor, run.elapsedMs)
-            val quality = TimeMath.quality(error)
+            val quality = TimeMath.quality(error, anchor.corroborated)
             val newOffset = run.deviceWallMs - trueAtRun
             val shift = run.offsetMs - newOffset
             if (shift == 0L && quality.name == run.quality) continue
@@ -229,6 +245,10 @@ class TimeCorrector(private val db: AppDatabase, private val clock: TrustedClock
             listOfNotNull(before, after).minOrNull()?.let { m ->
                 minAffected = minOf(minAffected ?: Long.MAX_VALUE, m)
             }
+        }
+        if (minAffected != null) {
+            // A marca d'água (fim da última leitura, em hora real) acompanha a correção.
+            db.ingestRunDao().lastOk()?.let { settings.watermarkUtc = it.observedEndUtc }
         }
         minAffected
     }

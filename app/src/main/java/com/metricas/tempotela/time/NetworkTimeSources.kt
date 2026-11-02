@@ -117,13 +117,14 @@ class NetworkTimeSources(private val context: Context) {
                     val t0Ms = t0 / 1_000_000
                     val t3Ms = t3 / 1_000_000
                     val m = SntpMath.measure(t0Ms, response.receiveMs, response.transmitMs, t3Ms)
+                    if (m.delayMs > SntpMath.MAX_DELAY_MS) continue
                     val sample = TimeSample(
                         source = TimeSource.SNTP,
                         server = host,
                         elapsedMs = t3Ms,
                         trueUtcMs = t3Ms + m.offsetMs,
                         deviceWallMs = wall3,
-                        errorMs = m.errorMs,
+                        errorMs = SntpMath.totalErrorMs(m, response),
                         rttMs = m.delayMs,
                     )
                     val current = best
@@ -158,6 +159,9 @@ class NetworkTimeSources(private val context: Context) {
             connection.readTimeout = HTTP_TIMEOUT_MS
             connection.useCaches = false
             connection.instanceFollowRedirects = false
+            // Evita respostas guardadas em cache intermediário (Date antigo).
+            connection.setRequestProperty("Cache-Control", "no-cache, no-store")
+            connection.setRequestProperty("Pragma", "no-cache")
             connection.connect()
             // t0 depois do handshake TLS: mede só a ida e volta da requisição.
             val t0 = SystemClock.elapsedRealtime()
@@ -166,7 +170,8 @@ class NetworkTimeSources(private val context: Context) {
             val wall3 = System.currentTimeMillis()
             val header = connection.getHeaderField("Date") ?: return null
             val date = HttpDateMath.parseRfc1123(header) ?: return null
-            val (trueAtT3, error) = HttpDateMath.estimate(date, t0, t3)
+            val age = connection.getHeaderField("Age")?.trim()?.toLongOrNull() ?: 0L
+            val (trueAtT3, error) = HttpDateMath.estimate(date, t0, t3, age)
             return TimeSample(
                 source = TimeSource.HTTPS_DATE,
                 server = URL(url).host,

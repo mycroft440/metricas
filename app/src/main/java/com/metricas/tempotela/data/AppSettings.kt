@@ -49,6 +49,11 @@ class AppSettings(context: Context) {
         get() = prefs.getBoolean(KEY_FULL_RECOMPUTE, true)
         set(value) = prefs.edit().putBoolean(KEY_FULL_RECOMPUTE, value).apply()
 
+    /** Versão do algoritmo usada no último recálculo completo. */
+    var algoVersion: Int
+        get() = prefs.getInt(KEY_ALGO_VERSION, 0)
+        set(value) = prefs.edit().putInt(KEY_ALGO_VERSION, value).apply()
+
     var lastPermissionGranted: Boolean?
         get() = if (prefs.contains(KEY_LAST_PERMISSION)) prefs.getBoolean(KEY_LAST_PERMISSION, false) else null
         set(value) {
@@ -72,6 +77,7 @@ class AppSettings(context: Context) {
         private const val KEY_WATERMARK = "watermark_utc"
         private const val KEY_FULL_RECOMPUTE = "needs_full_recompute"
         private const val KEY_LAST_PERMISSION = "last_permission_granted"
+        private const val KEY_ALGO_VERSION = "algo_version"
 
         fun isValidZone(id: String): Boolean = try {
             ZoneId.of(id.trim())

@@ -78,7 +78,7 @@ class SessionizerTest {
 
     @Test
     fun aparelhoSemBloqueioDeTela() {
-        val r = Sessionizer(Sessionizer.Config(noKeyguard = true)).run(
+        val r = Sessionizer(Sessionizer.Config(noKeyguardHint = true)).run(
             listOf(
                 ev(0, SCREEN_INTERACTIVE),
                 ev(900, SCREEN_NON_INTERACTIVE),

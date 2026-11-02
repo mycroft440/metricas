@@ -6,6 +6,8 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Update
 
+data class TypeCount(val type: Int, val n: Int)
+
 @Dao
 interface RawEventDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
@@ -31,6 +33,9 @@ interface RawEventDao {
 
     @Query("SELECT COUNT(*) FROM raw_event WHERE quality != 'VERIFICADA'")
     suspend fun unverifiedCount(): Int
+
+    @Query("SELECT type, COUNT(*) AS n FROM raw_event WHERE tsUtc >= :fromUtc GROUP BY type")
+    suspend fun countsByTypeSince(fromUtc: Long): List<TypeCount>
 
     @Query(
         "UPDATE raw_event SET tsUtc = tsDevice - :offsetMs, offsetMs = :offsetMs, " +
@@ -124,6 +129,10 @@ interface SessionDao {
 
     @Query("DELETE FROM usage_session WHERE startUtc >= :fromUtc")
     suspend fun deleteFrom(fromUtc: Long): Int
+
+    /** Sessões que terminam a partir de [fromUtc] e começaram dentro da janela recalculada. */
+    @Query("DELETE FROM usage_session WHERE endUtc >= :fromUtc AND startUtc >= :warmupStartUtc")
+    suspend fun deleteEndingFrom(fromUtc: Long, warmupStartUtc: Long): Int
 
     @Query("DELETE FROM usage_session")
     suspend fun deleteAll(): Int

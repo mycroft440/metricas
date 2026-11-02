@@ -5,11 +5,15 @@ import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import kotlin.math.abs
 
-enum class TimeSource(val label: String) {
-    TRUSTED_TIME("Google TrustedTime"),
-    NETWORK_CLOCK("Hora de rede do Android"),
-    SNTP("NTP"),
-    HTTPS_DATE("Cabeçalho HTTPS Date"),
+/**
+ * Fontes de hora. [authenticated] = o caminho até o servidor é protegido contra adulteração
+ * (TLS / Play services). NTP e a hora de rede do sistema trafegam sem autenticação.
+ */
+enum class TimeSource(val label: String, val authenticated: Boolean) {
+    TRUSTED_TIME("Google TrustedTime", true),
+    NETWORK_CLOCK("Hora de rede do Android", false),
+    SNTP("NTP", false),
+    HTTPS_DATE("Cabeçalho HTTPS Date", true),
 }
 
 /**
@@ -42,6 +46,8 @@ data class TimeAnchor(
     val errorMs: Long,
     val source: TimeSource,
     val server: String,
+    /** Confirmada por fonte autenticada ou por duas fontes independentes que concordam. */
+    val corroborated: Boolean = true,
 )
 
 object TimeMath {
@@ -50,13 +56,20 @@ object TimeMath {
     const val VERIFIED_MAX_ERROR_MS = 2_000L
     const val JUMP_THRESHOLD_MS = 2_000L
 
+    /** Concordância mínima exigida entre duas fontes. */
+    const val AGREEMENT_MIN_MS = 2_000L
+
+    /** Limites de plausibilidade: rejeita respostas absurdas (servidor quebrado ou falsificado). */
+    const val MIN_PLAUSIBLE_UTC = 1_735_689_600_000L // 2025-01-01
+    const val MAX_PLAUSIBLE_UTC = 4_102_444_800_000L // 2100-01-01
+
     fun trueAt(anchor: TimeAnchor, elapsedMs: Long): Long = anchor.trueUtcMs + (elapsedMs - anchor.elapsedMs)
 
     fun errorAt(anchor: TimeAnchor, elapsedMs: Long): Long =
         anchor.errorMs + abs(elapsedMs - anchor.elapsedMs) * DRIFT_PPM / 1_000_000
 
-    fun quality(errorMs: Long): TimeQuality =
-        if (errorMs <= VERIFIED_MAX_ERROR_MS) TimeQuality.VERIFICADA else TimeQuality.INFERIDA
+    fun quality(errorMs: Long, corroborated: Boolean = true): TimeQuality =
+        if (corroborated && errorMs <= VERIFIED_MAX_ERROR_MS) TimeQuality.VERIFICADA else TimeQuality.INFERIDA
 
     /** Salto do relógio do aparelho entre duas leituras do mesmo boot. */
     fun clockJumpMs(prevElapsed: Long, prevWall: Long, nowElapsed: Long, nowWall: Long): Long =
@@ -66,28 +79,64 @@ object TimeMath {
     fun isClockJump(deltaMs: Long, elapsedSpanMs: Long): Boolean =
         abs(deltaMs) > JUMP_THRESHOLD_MS + abs(elapsedSpanMs) / 10_000
 
-    data class Choice(val best: TimeSample, val disagreementMs: Long)
+    fun isPlausible(sample: TimeSample): Boolean =
+        sample.trueUtcMs in MIN_PLAUSIBLE_UTC..MAX_PLAUSIBLE_UTC && sample.errorMs >= 0
 
-    /** Escolhe a medição de menor erro e mede a maior divergência entre as fontes. */
+    fun agree(a: TimeSample, b: TimeSample): Boolean =
+        abs(a.elapsedToUtcMs - b.elapsedToUtcMs) <= maxOf(AGREEMENT_MIN_MS, a.errorMs + b.errorMs)
+
+    data class Choice(
+        val best: TimeSample,
+        val disagreementMs: Long,
+        /** Medições descartadas por discordarem do consenso. */
+        val rejected: List<TimeSample>,
+        val corroborated: Boolean,
+    )
+
+    /**
+     * Escolha por consenso (não só "menor erro"), para que uma única fonte falsificada ou
+     * quebrada — por exemplo um NTP adulterado na rede — não defina a hora do app:
+     *
+     * 1. descarta respostas implausíveis;
+     * 2. se há fonte autenticada (TrustedTime/HTTPS), ela é a referência: só valem as
+     *    medições que concordam com ela;
+     * 3. sem fonte autenticada, vale o maior grupo de fontes que concordam entre si;
+     * 4. dentro do grupo vencedor, usa a de menor erro.
+     */
     fun choose(samples: List<TimeSample>): Choice? {
-        if (samples.isEmpty()) return null
-        val best = samples.minWith(compareBy<TimeSample>({ it.errorMs }, { it.source.ordinal }))
-        val disagreement = samples.maxOf { abs(it.elapsedToUtcMs - best.elapsedToUtcMs) }
-        return Choice(best, disagreement)
+        val valid = samples.filter { isPlausible(it) }
+        if (valid.isEmpty()) return null
+        val byError = compareBy<TimeSample>({ it.errorMs }, { it.source.ordinal })
+
+        val trusted = valid.filter { it.source.authenticated }
+        val group: List<TimeSample> = if (trusted.isNotEmpty()) {
+            val reference = trusted.minWith(byError)
+            valid.filter { it === reference || agree(it, reference) }
+        } else {
+            valid.map { c -> valid.filter { it === c || agree(it, c) } }
+                .maxWith(compareBy<List<TimeSample>>({ it.size }, { -it.minOf { s -> s.errorMs } }))
+        }
+        val best = group.minWith(byError)
+        val rejected = valid.filter { s -> group.none { it === s } }
+        val disagreement = valid.maxOf { abs(it.elapsedToUtcMs - best.elapsedToUtcMs) }
+        val corroborated = best.source.authenticated || group.map { it.source to it.server }.toSet().size >= 2
+        return Choice(best, disagreement, rejected, corroborated)
     }
 }
 
 object HttpDateMath {
     /**
      * O cabeçalho `Date` tem resolução de 1 s (truncado): a hora real no servidor está em
-     * [D, D + 1000). Supõe que foi gerado no meio da ida e volta.
+     * [D, D + 1000). Supõe que foi gerado no meio da ida e volta. Se a resposta veio de um
+     * cache intermediário, o cabeçalho `Age` (segundos) indica há quanto tempo foi gerada.
      *
      * @return hora real no instante [t3ElapsedMs] e o erro estimado.
      */
-    fun estimate(dateHeaderMs: Long, t0ElapsedMs: Long, t3ElapsedMs: Long): Pair<Long, Long> {
+    fun estimate(dateHeaderMs: Long, t0ElapsedMs: Long, t3ElapsedMs: Long, ageSeconds: Long = 0): Pair<Long, Long> {
         val rtt = (t3ElapsedMs - t0ElapsedMs).coerceAtLeast(0)
-        val trueAtT3 = dateHeaderMs + 500 + rtt / 2
-        val error = 500 + rtt / 2
+        val age = ageSeconds.coerceAtLeast(0)
+        val trueAtT3 = dateHeaderMs + age * 1000 + 500 + rtt / 2
+        val error = 500 + rtt / 2 + if (age > 0) 1_000 else 0
         return trueAtT3 to error
     }
 

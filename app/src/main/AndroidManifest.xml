@@ -33,9 +33,10 @@
             </intent-filter>
         </activity>
 
+        <!-- Só o sistema entrega estes broadcasts protegidos: receivers não exportados. -->
         <receiver
             android:name=".work.BootReceiver"
-            android:exported="true">
+            android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
@@ -43,7 +44,7 @@
 
         <receiver
             android:name=".work.TimeChangeReceiver"
-            android:exported="true">
+            android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.TIME_SET" />
                 <action android:name="android.intent.action.TIMEZONE_CHANGED" />
