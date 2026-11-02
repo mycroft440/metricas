@@ -8,7 +8,8 @@ import com.metricas.core.time.ClockSnapshot
 import com.metricas.core.time.InferredAnchor
 import com.metricas.core.time.TimeAnchor
 import com.metricas.core.time.TimeSource
-import com.metricas.tempotela.platform.DeviceClock
+import android.content.SharedPreferences
+import com.metricas.tempotela.platform.DeviceEnvironment
 
 /**
  * Única fonte de "agora" do app: hora real obtida pela internet, extrapolada pelo relógio
@@ -19,8 +20,13 @@ import com.metricas.tempotela.platform.DeviceClock
  *
  * Leitura síncrona (SharedPreferences em memória), segura na thread principal.
  */
-class TrustedClock(private val context: Context) {
-    private val prefs = context.getSharedPreferences("trusted_clock", Context.MODE_PRIVATE)
+class TrustedClock(
+    private val prefs: SharedPreferences,
+    private val env: DeviceEnvironment,
+) {
+    constructor(context: Context, env: DeviceEnvironment) :
+        this(context.getSharedPreferences("trusted_clock", Context.MODE_PRIVATE), env)
+
     private val lock = Any()
 
     @Volatile
@@ -85,10 +91,7 @@ class TrustedClock(private val context: Context) {
     /** Âncora da internet utilizável neste boot. */
     fun anchorForCurrentBoot(): TimeAnchor? = ClockLogic.usable(anchor(), snapshot())
 
-    fun snapshot(): ClockSnapshot {
-        val c = DeviceClock.read(context)
-        return ClockSnapshot(c.bootCount, c.elapsedMs, c.wallMs)
-    }
+    fun snapshot(): ClockSnapshot = env.clock()
 
     fun read(): ClockReading = synchronized(lock) {
         val result = ClockLogic.read(anchor(), inferredAnchor(), lastVerifiedOffset(), snapshot())

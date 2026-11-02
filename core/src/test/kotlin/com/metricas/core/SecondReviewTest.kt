@@ -94,4 +94,14 @@ class SecondReviewTest {
             listOf(DeviceEvent(1_700_000, SCREEN_INTERACTIVE), DeviceEvent(1_900_000, SCREEN_NON_INTERACTIVE))
         assertEquals(0L, EventDedupe.detectHistoryShift(candidates, stored))
     }
+
+    @Test
+    fun deslocamentoComUmSoEventoUsaOAjusteMedido() {
+        val stored = listOf(StoredEventKey(1_000_000, 1_000_000, SCREEN_INTERACTIVE, 1))
+        val candidates = listOf(DeviceEvent(1_000_000 + 3_600_037, SCREEN_INTERACTIVE))
+        // Sem o ajuste medido não há evidência suficiente.
+        assertEquals(0L, EventDedupe.detectHistoryShift(candidates, stored))
+        // Com o ajuste medido pelo app (+1 h, aproximado), confirma o deslocamento exato.
+        assertEquals(3_600_037L, EventDedupe.detectHistoryShift(candidates, stored, hintShiftMs = 3_600_000))
+    }
 }

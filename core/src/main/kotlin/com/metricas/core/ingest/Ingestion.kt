@@ -55,8 +55,21 @@ object EventDedupe {
         candidates: List<DeviceEvent>,
         expectedInOverlap: List<StoredEventKey>,
         maxShiftMs: Long = 2L * 24 * 60 * 60 * 1000,
+        /** Ajuste de relógio medido pelo app (aproximado); permite confirmar com 1 só evento. */
+        hintShiftMs: Long? = null,
+        hintToleranceMs: Long = 250,
     ): Long {
-        if (expectedInOverlap.size < 2 || candidates.isEmpty()) return 0
+        if (expectedInOverlap.isEmpty() || candidates.isEmpty()) return 0
+        if (expectedInOverlap.size == 1) {
+            // Pouca evidência: só aceita se bater com o ajuste de relógio que o app mediu.
+            val hint = hintShiftMs ?: return 0
+            val e = expectedInOverlap[0]
+            if (candidates.any { it.type == e.type && it.tsDevice == e.tsDevice }) return 0
+            val match = candidates
+                .filter { it.type == e.type && kotlin.math.abs(it.tsDevice - e.tsDevice - hint) <= hintToleranceMs }
+                .minByOrNull { kotlin.math.abs(it.tsDevice - e.tsDevice - hint) }
+            return match?.let { it.tsDevice - e.tsDevice } ?: 0
+        }
         val byType = candidates.groupBy({ it.type }, { it.tsDevice }).mapValues { it.value.sorted() }
         val counts = HashMap<Long, Int>()
         for (e in expectedInOverlap) {

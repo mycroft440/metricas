@@ -34,9 +34,16 @@ jobs:
       - name: Permissão do gradlew
         run: chmod +x gradlew
 
-      - name: Testes do núcleo e compilação dos APKs
-        # --continue: mesmo se um teste falhar, a compilação do app roda e todos os erros aparecem.
-        run: ./gradlew --continue :core:test :app:assembleDebug :app:assembleRelease
+      - name: Testes (núcleo + pipeline Android na JVM) e compilação dos APKs
+        # --continue: mesmo se um teste falhar, a compilação roda e todos os erros aparecem.
+        run: ./gradlew --continue :core:test :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease
+
+      - name: Esquema do banco (Room) deve estar versionado
+        run: |
+          if [ -n "$(git status --porcelain app/schemas)" ]; then
+            echo "::warning::O esquema do banco mudou e não está no repositório. Versione app/schemas e crie uma migração."
+            git status --porcelain app/schemas
+          fi
 
       - name: Publicar APKs
         uses: actions/upload-artifact@v6
@@ -45,10 +52,64 @@ jobs:
           path: app/build/outputs/apk/**/*.apk
           if-no-files-found: error
 
-      - name: Relatório dos testes (em caso de falha)
+      - name: Publicar esquema do banco
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: room-schemas
+          path: app/schemas/
+          if-no-files-found: ignore
+
+      - name: Relatórios dos testes (em caso de falha)
         if: failure()
         uses: actions/upload-artifact@v6
         with:
           name: relatorio-testes
-          path: core/build/reports/tests/
+          path: |
+            core/build/reports/tests/
+            app/build/reports/tests/
+          if-no-files-found: ignore
+
+  emulator:
+    name: Teste ponta a ponta no emulador (Android 14)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Permissão do gradlew
+        run: chmod +x gradlew
+
+      - name: Habilitar KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Teste no emulador
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: ./gradlew --no-daemon :app:connectedDebugAndroidTest
+
+      - name: Relatório do teste no emulador
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: relatorio-emulador
+          path: app/build/reports/androidTests/
           if-no-files-found: ignore

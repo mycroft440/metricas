@@ -20,11 +20,19 @@ import java.security.SecureRandom
 import java.time.DateTimeException
 import java.util.concurrent.TimeUnit
 
+/** Fontes de hora pela internet. Interface para permitir testes com fontes simuladas. */
+interface TimeSources {
+    fun trustedTime(): TimeSample?
+    fun networkClock(): TimeSample?
+    fun sntp(): TimeSample?
+    fun httpsDate(): TimeSample?
+}
+
 /**
  * Fontes de hora pela internet, em ordem de preferência (Seção 3.2 do plano).
  * Todas as funções bloqueiam: chamar fora da thread principal.
  */
-class NetworkTimeSources(private val context: Context) {
+class NetworkTimeSources(private val context: Context) : TimeSources {
 
     @Volatile
     private var trustedClient: TrustedTimeClient? = null
@@ -40,7 +48,7 @@ class NetworkTimeSources(private val context: Context) {
     }
 
     /** 1. Google Play services TrustedTime (traz estimativa de erro). */
-    fun trustedTime(): TimeSample? {
+    override fun trustedTime(): TimeSample? {
         val client = trustedTimeClient() ?: return null
         val signal = client.latestTimeSignal ?: return null
         val el0 = SystemClock.elapsedRealtime()
@@ -60,7 +68,7 @@ class NetworkTimeSources(private val context: Context) {
     }
 
     /** 2. Hora de rede mantida pelo próprio Android (API 33+). */
-    fun networkClock(): TimeSample? =
+    override fun networkClock(): TimeSample? =
         if (Build.VERSION.SDK_INT >= 33) networkClock33() else null
 
     @RequiresApi(33)
@@ -84,7 +92,7 @@ class NetworkTimeSources(private val context: Context) {
     }
 
     /** 3. SNTP direto: NTP.br (Hora Legal Brasileira) e Google. */
-    fun sntp(): TimeSample? {
+    override fun sntp(): TimeSample? {
         for (host in SNTP_SERVERS) {
             val sample = try {
                 sntpFrom(host)
@@ -139,7 +147,7 @@ class NetworkTimeSources(private val context: Context) {
     }
 
     /** 4. Cabeçalho HTTP `Date` via HTTPS (precisão de ~1 s). */
-    fun httpsDate(): TimeSample? {
+    override fun httpsDate(): TimeSample? {
         for (url in HTTPS_URLS) {
             val sample = try {
                 httpsDateFrom(url)

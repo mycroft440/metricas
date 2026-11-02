@@ -481,6 +481,13 @@ fun QualityScreen(state: UiState, vm: MainViewModel) {
                         Text("Nenhum problema detectado.", style = MaterialTheme.typography.bodySmall)
                     }
                     KeyValue("Maior intervalo sem coleta (30 dias)", Fmt.duration(q.largestIngestGapMs30d))
+                    if (q.multipleUsers) {
+                        Text(
+                            "Este aparelho permite vários usuários. Se trocar de usuário com o seu desbloqueado, " +
+                                "o tempo do outro usuário pode ser somado ao seu até você voltar. Bloqueie antes de trocar.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
                     KeyValue("Dias com inconsistência", q.inconsistentDays.toString())
                     Text("Eventos registrados nos últimos 7 dias:", style = MaterialTheme.typography.bodySmall)
                     for (type in com.metricas.core.model.EventType.TRACKED) {

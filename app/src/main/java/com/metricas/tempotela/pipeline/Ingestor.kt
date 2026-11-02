@@ -10,8 +10,8 @@ import com.metricas.tempotela.data.db.AppDatabase
 import com.metricas.tempotela.data.db.IngestRunEntity
 import com.metricas.tempotela.data.db.PermissionLogEntity
 import com.metricas.tempotela.data.db.RawEventEntity
-import com.metricas.tempotela.platform.DeviceState
-import com.metricas.tempotela.platform.UsageAccess
+import com.metricas.tempotela.platform.DeviceEnvironment
+import com.metricas.tempotela.platform.EventSource
 import com.metricas.tempotela.platform.UsageEventSource
 import com.metricas.tempotela.time.ClockEpochTracker
 import com.metricas.tempotela.time.TrustedClock
@@ -28,12 +28,12 @@ import kotlinx.coroutines.withContext
  * convertendo cada carimbo para a hora real (Seções 3.4 e 6 do plano).
  */
 class Ingestor(
-    private val context: Context,
+    private val env: DeviceEnvironment,
     private val db: AppDatabase,
     private val settings: AppSettings,
     private val clock: TrustedClock,
     private val epochs: ClockEpochTracker,
-    private val usage: UsageEventSource,
+    private val usage: EventSource,
 ) {
     private val mutex = Mutex()
 
@@ -50,10 +50,10 @@ class Ingestor(
     }
 
     private suspend fun ingestLocked(trigger: String): Result {
-        val granted = UsageAccess.has(context)
+        val granted = env.hasUsageAccess()
         logPermission(granted)
         if (!granted) return Result(false, "Acesso ao uso não concedido")
-        if (!DeviceState.isUserUnlocked(context)) return Result(false, "Aparelho ainda não desbloqueado após o boot")
+        if (!env.isUserUnlocked()) return Result(false, "Aparelho ainda não desbloqueado após o boot")
 
         val epoch = epochs.check(trigger) { clock.now() }
         val reading = clock.read()
@@ -90,7 +90,7 @@ class Ingestor(
             val raw = usage.query(beginDevice, endDevice)
             // Sem permissão o Android devolve lista vazia (não erro): não avança a marca d'água
             // nem marca o período como observado com "0 uso".
-            if (!UsageAccess.has(context)) throw IllegalStateException("acesso ao uso revogado durante a leitura")
+            if (!env.hasUsageAccess()) throw IllegalStateException("acesso ao uso revogado durante a leitura")
             val fresh: List<DeviceEvent> = if (raw.isEmpty()) {
                 emptyList()
             } else {
@@ -101,7 +101,11 @@ class Ingestor(
                 // Eventos já guardados que deveriam voltar nesta leitura (sobreposição).
                 val overlapEnd = previousWatermark ?: Long.MIN_VALUE
                 val expected = existing.filter { it.tsUtc >= beginDevice - offset && it.tsUtc <= overlapEnd }
-                val shift = EventDedupe.detectHistoryShift(raw, expected)
+                // Ajustes de relógio detectados desde a última leitura (podem ter sido vistos por
+                // outra parte do app, ex.: receiver de TIME_SET), usados como pista do deslocamento.
+                val lastEpoch = db.ingestRunDao().lastOk()?.epochId
+                val hint = lastEpoch?.let { db.clockEpochDao().jumpSumAfter(it) }?.takeIf { it != 0L }
+                val shift = EventDedupe.detectHistoryShift(raw, expected, hintShiftMs = hint)
                 if (shift != 0L) {
                     db.clockEventDao().insert(
                         ClockEventEntity(

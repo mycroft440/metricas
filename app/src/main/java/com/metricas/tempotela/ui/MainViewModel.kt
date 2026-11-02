@@ -74,6 +74,7 @@ data class QualityInfo(
     val inconsistentDays: Int,
     val unusedAppRestrictions: Boolean,
     val batteryOptimized: Boolean,
+    val multipleUsers: Boolean,
     /** Avisos que exigem atenção do usuário para manter as medições corretas. */
     val alerts: List<String>,
 )
@@ -362,6 +363,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             inconsistentDays = inconsistentDays,
             unusedAppRestrictions = unusedRestrictions,
             batteryOptimized = batteryOptimized,
+            multipleUsers = BackgroundProtection.multipleUsersPossible(getApplication<Application>()),
             alerts = alerts,
         )
 

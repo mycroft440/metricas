@@ -90,6 +90,10 @@ interface ClockEpochDao {
 
     @Query("SELECT COUNT(*) FROM clock_epoch")
     suspend fun count(): Int
+
+    /** Soma dos ajustes de relógio detectados depois da época [afterId]. */
+    @Query("SELECT COALESCE(SUM(jumpDeltaMs), 0) FROM clock_epoch WHERE id > :afterId AND reason = 'AJUSTE_DE_RELOGIO'")
+    suspend fun jumpSumAfter(afterId: Long): Long
 }
 
 @Dao
@@ -157,6 +161,9 @@ interface DailySummaryDao {
 
     @Query("SELECT * FROM daily_summary ORDER BY date")
     suspend fun all(): List<DailySummaryEntity>
+
+    @Query("SELECT MAX(date) FROM daily_summary")
+    suspend fun latestDate(): String?
 }
 
 @Dao

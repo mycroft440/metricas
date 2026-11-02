@@ -25,6 +25,37 @@ import androidx.core.content.UnusedAppRestrictionsConstants
 import java.util.concurrent.TimeUnit
 import com.metricas.core.ingest.DeviceEvent
 import com.metricas.core.model.EventType
+import com.metricas.core.time.ClockSnapshot
+
+/**
+ * Tudo que o pipeline precisa saber do aparelho. Interface para permitir testes com um
+ * aparelho simulado (relógio, reboots, permissões, rede).
+ */
+interface DeviceEnvironment {
+    fun hasUsageAccess(): Boolean
+    fun isUserUnlocked(): Boolean
+    fun isDeviceSecure(): Boolean
+    fun hasInternet(): Boolean
+    fun clock(): ClockSnapshot
+}
+
+class AndroidEnvironment(context: Context) : DeviceEnvironment {
+    private val context = context.applicationContext
+    override fun hasUsageAccess(): Boolean = UsageAccess.has(context)
+    override fun isUserUnlocked(): Boolean = DeviceState.isUserUnlocked(context)
+    override fun isDeviceSecure(): Boolean = DeviceState.isDeviceSecure(context)
+    override fun hasInternet(): Boolean = DeviceState.hasInternet(context)
+    override fun clock(): ClockSnapshot {
+        val c = DeviceClock.read(context)
+        return ClockSnapshot(c.bootCount, c.elapsedMs, c.wallMs)
+    }
+}
+
+/** Fonte dos eventos registrados pelo sistema (carimbos no relógio do aparelho). */
+interface EventSource {
+    /** [beginDevice, endDevice) no relógio do aparelho. */
+    fun query(beginDevice: Long, endDevice: Long): List<DeviceEvent>
+}
 
 /** Leituras dos três relógios do aparelho no mesmo instante. */
 data class DeviceClockReading(val bootCount: Int, val elapsedMs: Long, val wallMs: Long)
@@ -115,6 +146,18 @@ object BackgroundProtection {
         return !pm.isIgnoringBatteryOptimizations(context.packageName)
     }
 
+    /**
+     * O aparelho permite trocar de usuário. O Android não avisa o usuário anterior quando outro
+     * assume o aparelho: se a troca for feita com este usuário desbloqueado, o tempo do outro
+     * usuário pode ser somado até a volta.
+     */
+    fun multipleUsersPossible(context: Context): Boolean = try {
+        UserManager.supportsMultipleUsers() &&
+            context.getSystemService(UserManager::class.java)?.isUserSwitcherEnabled == true
+    } catch (e: Exception) {
+        false
+    }
+
     fun batterySettingsIntent(): Intent =
         Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 }
@@ -134,11 +177,11 @@ object DeviceState {
 }
 
 /** Lê os eventos de tela/keyguard/boot registrados pelo sistema (UsageStatsManager). */
-class UsageEventSource(context: Context) {
+class UsageEventSource(context: Context) : EventSource {
     private val usm = context.getSystemService(UsageStatsManager::class.java)
 
     /** [beginDevice, endDevice) no relógio do aparelho, em blocos de 1 dia. */
-    fun query(beginDevice: Long, endDevice: Long): List<DeviceEvent> {
+    override fun query(beginDevice: Long, endDevice: Long): List<DeviceEvent> {
         val out = ArrayList<DeviceEvent>()
         if (usm == null || endDevice <= beginDevice) return out
         var start = beginDevice

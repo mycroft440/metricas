@@ -10,8 +10,8 @@ import com.metricas.tempotela.data.db.ClockEpochEntity
 import com.metricas.tempotela.data.db.ClockEventEntity
 import com.metricas.tempotela.data.db.TimeSyncEntity
 import com.metricas.tempotela.data.db.ZoneHistoryEntity
-import com.metricas.tempotela.platform.DeviceClock
-import com.metricas.tempotela.platform.DeviceState
+import android.content.SharedPreferences
+import com.metricas.tempotela.platform.DeviceEnvironment
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -23,9 +23,14 @@ import kotlin.math.abs
  * Detecta "épocas de relógio": períodos em que a relação entre o relógio do aparelho e o
  * `elapsedRealtime` é constante. Muda no boot ou quando o relógio é ajustado (> 2 s).
  */
-class ClockEpochTracker(context: Context, private val db: AppDatabase) {
-    private val appContext = context.applicationContext
-    private val prefs = context.getSharedPreferences("clock_epoch", Context.MODE_PRIVATE)
+class ClockEpochTracker(
+    private val prefs: SharedPreferences,
+    private val db: AppDatabase,
+    private val env: DeviceEnvironment,
+) {
+    constructor(context: Context, db: AppDatabase, env: DeviceEnvironment) :
+        this(context.getSharedPreferences("clock_epoch", Context.MODE_PRIVATE), db, env)
+
     private val mutex = Mutex()
 
     data class Check(
@@ -37,7 +42,7 @@ class ClockEpochTracker(context: Context, private val db: AppDatabase) {
     )
 
     suspend fun check(trigger: String, nowTrueUtc: () -> Long): Check = mutex.withLock {
-        val clock = DeviceClock.read(appContext)
+        val clock = env.clock()
         val prevBoot = prefs.getInt(KEY_BOOT, Int.MIN_VALUE)
         val prevElapsed = prefs.getLong(KEY_ELAPSED, 0)
         val prevWall = prefs.getLong(KEY_WALL, 0)
@@ -100,18 +105,18 @@ sealed class SyncOutcome {
 
 /** Consulta as fontes de hora em cascata, escolhe a melhor e grava a âncora. */
 class TimeSyncer(
-    private val context: Context,
+    private val env: DeviceEnvironment,
     private val db: AppDatabase,
     private val clock: TrustedClock,
     private val epochs: ClockEpochTracker,
-    private val sources: NetworkTimeSources,
+    private val sources: TimeSources,
 ) {
     private val mutex = Mutex()
 
     suspend fun sync(trigger: String): SyncOutcome = mutex.withLock {
         withContext(Dispatchers.IO) {
             val epoch = epochs.check(trigger) { clock.now() }
-            if (!DeviceState.hasInternet(context)) {
+            if (!env.hasInternet()) {
                 return@withContext SyncOutcome.Failure("sem conexão com a internet")
             }
             val samples = ArrayList<TimeSample>()
@@ -141,7 +146,7 @@ class TimeSyncer(
             val choice = TimeMath.choose(samples)
             if (choice == null) {
                 val reason = errors.joinToString("; ").ifEmpty { "nenhuma fonte respondeu" }
-                val c = DeviceClock.read(context)
+                val c = env.clock()
                 db.timeSyncDao().insert(
                     TimeSyncEntity(
                         triggerName = trigger,

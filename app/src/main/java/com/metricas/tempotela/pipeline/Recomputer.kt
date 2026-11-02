@@ -18,7 +18,7 @@ import com.metricas.tempotela.data.db.DailySummaryEntity
 import com.metricas.tempotela.data.db.HourlyBucketEntity
 import com.metricas.tempotela.data.db.SessionEntity
 import com.metricas.tempotela.data.db.ZoneHistoryEntity
-import com.metricas.tempotela.platform.DeviceState
+import com.metricas.tempotela.platform.DeviceEnvironment
 import com.metricas.tempotela.time.TrustedClock
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
@@ -40,7 +40,7 @@ data class LiveState(
 
 /** Recalcula sessões, totais diários, horas e cobertura a partir dos eventos brutos. */
 class Recomputer(
-    private val context: Context,
+    private val env: DeviceEnvironment,
     private val db: AppDatabase,
     private val settings: AppSettings,
     private val clock: TrustedClock,
@@ -89,6 +89,12 @@ class Recomputer(
             val affectedDay = resolver.dayOf(affectedFromUtc)
             if (affectedDay.isBefore(fromDay)) fromDay = affectedDay
         }
+        if (!full) {
+            // Depois de dias sem rodar, recalcula desde o último dia já gravado: os dias do meio
+            // precisam existir (como lacuna ou completos) e o último "hoje" gravado precisa fechar.
+            val lastStored = db.dailySummaryDao().latestDate()?.let { runCatching { LocalDate.parse(it) }.getOrNull() }
+            if (lastStored != null && lastStored.isBefore(fromDay)) fromDay = lastStored
+        }
         if (fromDay.isBefore(firstDay)) fromDay = firstDay
         if (fromDay.isAfter(today)) fromDay = today
 
@@ -97,7 +103,7 @@ class Recomputer(
         val events = db.rawEventDao().eventsFrom(warmupStart).map {
             UsageEvent(it.tsUtc, it.type, it.id, TimeQuality.parse(it.quality))
         }
-        val noKeyguardHint = !DeviceState.isDeviceSecure(context)
+        val noKeyguardHint = !env.isDeviceSecure()
 
         // Cobertura: leituras unidas com tolerância (pequenos desvios após correções de hora não
         // viram "lacuna"). Lacunas reais (dados que expiraram) interrompem as sessões.
