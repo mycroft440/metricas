@@ -39,10 +39,13 @@ jobs:
         run: ./gradlew --continue :core:test :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease
 
       - name: Esquema do banco (Room) deve estar versionado
+        # Mudou a estrutura do banco sem nova versão/migração? Falha aqui para não perder dados.
         run: |
           if [ -n "$(git status --porcelain app/schemas)" ]; then
-            echo "::warning::O esquema do banco mudou e não está no repositório. Versione app/schemas e crie uma migração."
+            echo "::error::O esquema do banco mudou e não está no repositório. Aumente a versão, crie a migração e versione app/schemas."
             git status --porcelain app/schemas
+            git diff app/schemas | head -50
+            exit 1
           fi
 
       - name: Publicar APKs

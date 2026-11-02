@@ -151,9 +151,9 @@ object BackgroundProtection {
      * assume o aparelho: se a troca for feita com este usuário desbloqueado, o tempo do outro
      * usuário pode ser somado até a volta.
      */
+    @Suppress("UNUSED_PARAMETER")
     fun multipleUsersPossible(context: Context): Boolean = try {
-        UserManager.supportsMultipleUsers() &&
-            context.getSystemService(UserManager::class.java)?.isUserSwitcherEnabled == true
+        UserManager.supportsMultipleUsers()
     } catch (e: Exception) {
         false
     }
