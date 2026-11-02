@@ -86,7 +86,7 @@ class PipelineTest {
         device.deviceOffset = -5 * MIN
         device.lock()
         refresh()
-        device.advance(117 * MIN) // 23:58 (hora real)
+        device.advance(118 * MIN - 1_000) // 22:00:01 → 23:58:00 (hora real)
         device.use(12 * MIN) // até 00:10 do dia 3
         device.advance(HOUR)
         refresh()
