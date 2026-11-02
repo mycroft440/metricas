@@ -1,6 +1,7 @@
 package com.metricas.tempotela.pipeline
 
 import android.content.Context
+import com.metricas.core.ingest.DeviceEvent
 import com.metricas.core.ingest.EventDedupe
 import com.metricas.core.ingest.Observation
 import com.metricas.core.ingest.StoredEventKey
@@ -84,7 +85,7 @@ class Ingestor(
 
         return try {
             val raw = usage.query(beginDevice, endDevice)
-            val fresh = if (raw.isEmpty()) {
+            val fresh: List<DeviceEvent> = if (raw.isEmpty()) {
                 emptyList()
             } else {
                 val minUtc = raw.minOf { it.tsDevice } - offset - DEDUPE_MARGIN_MS
