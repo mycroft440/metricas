@@ -17,6 +17,7 @@ import com.metricas.core.day.DayResolver
 import com.metricas.tempotela.data.db.ClockEventEntity
 import com.metricas.tempotela.graph
 import com.metricas.tempotela.time.SyncOutcome
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -32,6 +33,8 @@ class IngestWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         return try {
             applicationContext.graph.pipeline.refresh(trigger)
             Result.success()
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             if (runAttemptCount < 3) Result.retry() else Result.failure()
         }
@@ -47,6 +50,8 @@ class TimeSyncWorker(context: Context, params: WorkerParameters) : CoroutineWork
                 is SyncOutcome.Success -> Result.success()
                 is SyncOutcome.Failure -> if (runAttemptCount < 3) Result.retry() else Result.failure()
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Result.retry()
         }
@@ -58,10 +63,13 @@ class DailyCloseWorker(context: Context, params: WorkerParameters) : CoroutineWo
     override suspend fun doWork(): Result {
         try {
             applicationContext.graph.pipeline.refresh("fechamento-diario")
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             // O próximo ciclo periódico recupera.
         }
-        Scheduler.scheduleDailyClose(applicationContext, replace = true)
+        // REPLACE aqui cancelaria este próprio worker; APPEND encadeia o próximo após este.
+        Scheduler.scheduleDailyClose(applicationContext, policy = ExistingWorkPolicy.APPEND_OR_REPLACE)
         return Result.success()
     }
 }
@@ -115,7 +123,10 @@ object Scheduler {
     }
 
     /** Atraso calculado pela hora real até a próxima virada de dia (+5 min). */
-    fun scheduleDailyClose(context: Context, replace: Boolean) {
+    fun scheduleDailyClose(context: Context, replace: Boolean) =
+        scheduleDailyClose(context, if (replace) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP)
+
+    fun scheduleDailyClose(context: Context, policy: ExistingWorkPolicy) {
         val graph = context.graph
         val settings = graph.settings
         val zone: ZoneId = if (settings.followDeviceZone) ZoneId.systemDefault() else settings.referenceZone()
@@ -125,7 +136,7 @@ object Scheduler {
         val delay = (nextDayStart + 5 * 60_000L - now).coerceAtLeast(60_000L)
         WorkManager.getInstance(context).enqueueUniqueWork(
             DAILY_CLOSE,
-            if (replace) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP,
+            policy,
             OneTimeWorkRequestBuilder<DailyCloseWorker>().setInitialDelay(delay, TimeUnit.MILLISECONDS).build(),
         )
     }

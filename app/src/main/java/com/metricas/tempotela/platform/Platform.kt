@@ -30,8 +30,24 @@ import com.metricas.core.model.EventType
 data class DeviceClockReading(val bootCount: Int, val elapsedMs: Long, val wallMs: Long)
 
 object DeviceClock {
-    fun bootCount(context: Context): Int =
-        Settings.Global.getInt(context.contentResolver, Settings.Global.BOOT_COUNT, -1)
+    /**
+     * Identificador do boot atual. O `elapsedRealtime` zera a cada boot, então tudo que é
+     * ancorado nele só vale no mesmo boot. Usa BOOT_COUNT; se o fabricante não o fornece,
+     * usa o boot_id do kernel.
+     */
+    fun bootCount(context: Context): Int {
+        val count = Settings.Global.getInt(context.contentResolver, Settings.Global.BOOT_COUNT, -1)
+        if (count >= 0) return count
+        return kernelBootId ?: -1
+    }
+
+    private val kernelBootId: Int? by lazy {
+        try {
+            java.io.File("/proc/sys/kernel/random/boot_id").readText().trim().hashCode() and 0x7FFF_FFFF
+        } catch (e: Exception) {
+            null
+        }
+    }
 
     fun read(context: Context): DeviceClockReading =
         DeviceClockReading(bootCount(context), SystemClock.elapsedRealtime(), System.currentTimeMillis())

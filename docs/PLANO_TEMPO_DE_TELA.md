@@ -719,6 +719,23 @@ Revisão feita sobre o código implementado, com a correção aplicada para cada
 | B14 | Receivers exportados | Superfície de ataque desnecessária | `exported=false` (broadcasts protegidos chegam do sistema) |
 | B15 | Mudança de algoritmo não recalculava o histórico | Dias antigos com regra antiga | Versão do algoritmo salva; mudança força recálculo completo |
 
+### Segunda revisão
+
+| # | Bug | Efeito antes | Correção |
+|---|---|---|---|
+| B16 | Lacuna de dados (histórico expirou) no meio de uma sessão aberta | Um desbloqueio antes da lacuna contava como uso durante dias | Sessões são encerradas no início de cada lacuna real (≥ 30 min); estado volta a "desconhecido" |
+| B17 | Pequenos desvios entre leituras após correções de hora | Dias marcados como parciais sem motivo | Cobertura une leituras com tolerância de 15 min |
+| B18 | Android corrige o relógio no boot (RTC adiantado/atrasado) e desloca todo o histórico | Eventos da sobreposição voltavam deslocados e eram gravados de novo | Detecção do deslocamento exato comparando eventos já guardados com os relidos; registrado em "Relógio e fuso" |
+| B19 | "Desbloqueios" contava também religar a tela dentro do atraso de bloqueio | Desbloqueios inflados | Só conta quem passou pela tela de bloqueio (ou aparelho sem bloqueio); sessões continuam contadas à parte |
+| B20 | Curva "dia típico" com corte do dia ≠ 00:00 | Comparação de "hoje até agora" errada para quem usa corte às 3–4 h | Curva rotacionada para começar no horário de corte |
+| B21 | Cancelamento de corrotina tratado como erro | Aviso falso "Erro ao atualizar" ao sair da tela; worker não parava ao ser cancelado | `CancellationException` é propagada em ingestão, pipeline, workers e tela |
+| B22 | Fechamento diário se reagendava com REPLACE de dentro de si mesmo | Podia cancelar o próprio worker | Usa APPEND_OR_REPLACE quando se reagenda |
+| B23 | Tentativas de sincronização a cada atualização quando só havia fonte não confirmada | Gasto de rede/bateria | Nova tentativa só após 15 min (exceto pedido manual) |
+| B24 | Marca d'água e estado interno incluídos no backup | Restaurar em outro aparelho pulava o histórico local | Estado interno em `device_state`, fora do backup (com migração) |
+| B25 | Aparelho sem BOOT_COUNT | Âncora de hora de um boot podia ser usada em outro | Usa o `boot_id` do kernel como alternativa |
+| B26 | Permissão revogada durante a leitura | Período marcado como "observado" com zero uso | Revalida a permissão após ler; se revogada, a leitura falha e nada avança |
+| B27 | Dias inconsistentes entravam nas médias | Média contaminada | Dias marcados como inconsistentes ficam fora das médias e da curva típica |
+
 Limitações conhecidas (não resolvíveis só com o app): aparelho com root pode adulterar
 qualquer dado; "forçar parada" ou limpar dados interrompe a coleta; trocar de usuário do
 Android (tablets) não gera evento de tela para o usuário anterior.

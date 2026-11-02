@@ -87,7 +87,7 @@ class SessionizerTest {
             ),
         )
         assertEquals(listOf(900_000L, 300_000L), r.sessions.map { it.durationMs })
-        assertTrue(r.sessions.all { it.startReason == StartReason.SCREEN_ON_NO_KEYGUARD })
+        assertTrue(r.sessions.all { it.startReason == StartReason.NO_LOCK_SCREEN })
     }
 
     @Test

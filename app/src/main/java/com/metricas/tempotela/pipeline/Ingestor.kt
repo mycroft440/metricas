@@ -15,7 +15,10 @@ import com.metricas.tempotela.platform.UsageAccess
 import com.metricas.tempotela.platform.UsageEventSource
 import com.metricas.tempotela.time.ClockEpochTracker
 import com.metricas.tempotela.time.TrustedClock
+import com.metricas.tempotela.data.db.ClockEventEntity
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -85,14 +88,32 @@ class Ingestor(
 
         return try {
             val raw = usage.query(beginDevice, endDevice)
+            // Sem permissão o Android devolve lista vazia (não erro): não avança a marca d'água
+            // nem marca o período como observado com "0 uso".
+            if (!UsageAccess.has(context)) throw IllegalStateException("acesso ao uso revogado durante a leitura")
             val fresh: List<DeviceEvent> = if (raw.isEmpty()) {
                 emptyList()
             } else {
-                val minUtc = raw.minOf { it.tsDevice } - offset - DEDUPE_MARGIN_MS
+                val minUtc = raw.minOf { it.tsDevice } - offset - SHIFT_SEARCH_MS
                 val maxUtc = raw.maxOf { it.tsDevice } - offset + DEDUPE_MARGIN_MS
                 val existing = db.rawEventDao().eventsBetween(minUtc, maxUtc)
                     .map { StoredEventKey(it.tsDevice, it.tsUtc, it.type, it.epochId) }
-                EventDedupe.filterNew(raw, offset, epoch.epochId, existing)
+                // Eventos já guardados que deveriam voltar nesta leitura (sobreposição).
+                val overlapEnd = previousWatermark ?: Long.MIN_VALUE
+                val expected = existing.filter { it.tsUtc >= beginDevice - offset && it.tsUtc <= overlapEnd }
+                val shift = EventDedupe.detectHistoryShift(raw, expected)
+                if (shift != 0L) {
+                    db.clockEventDao().insert(
+                        ClockEventEntity(
+                            detectedAtUtc = reading.trueNowUtc,
+                            kind = "HISTORICO_DESLOCADO",
+                            deltaMs = shift,
+                            oldZone = null,
+                            newZone = null,
+                        ),
+                    )
+                }
+                EventDedupe.filterNew(raw, offset, epoch.epochId, existing, historyShiftMs = shift)
             }
             val entities = fresh.map {
                 RawEventEntity(
@@ -131,6 +152,11 @@ class Ingestor(
                 eventsNew = inserted,
                 affectedFromUtc = entities.minOfOrNull { it.tsUtc },
             )
+        } catch (e: CancellationException) {
+            withContext(NonCancellable) {
+                db.ingestRunDao().update(run.copy(ok = false, error = "cancelada"))
+            }
+            throw e
         } catch (e: Exception) {
             db.ingestRunDao().update(run.copy(ok = false, error = e.javaClass.simpleName + ": " + e.message))
             Result(false, "Falha ao ler eventos: ${e.message}")
@@ -147,5 +173,8 @@ class Ingestor(
         const val OVERLAP_MS = 30L * 60 * 1000
         const val BACKFILL_MS = 11L * 24 * 60 * 60 * 1000
         const val DEDUPE_MARGIN_MS = 10_000L
+
+        /** Janela para procurar eventos já guardados que o Android possa ter deslocado. */
+        const val SHIFT_SEARCH_MS = 2L * 24 * 60 * 60 * 1000
     }
 }

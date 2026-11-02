@@ -5,7 +5,16 @@ import com.metricas.core.model.Interval
 import com.metricas.core.model.TimeQuality
 import com.metricas.core.model.UsageEvent
 
-enum class StartReason { UNLOCK, SCREEN_ON_NO_KEYGUARD }
+enum class StartReason(val isUnlock: Boolean) {
+    /** Passou pela tela de bloqueio. */
+    UNLOCK(true),
+
+    /** Tela religada antes do bloqueio entrar (atraso de bloqueio): continua o uso, não é desbloqueio. */
+    SCREEN_ON_NO_KEYGUARD(false),
+
+    /** Aparelho sem tela de bloqueio: cada vez que a tela liga conta como desbloqueio. */
+    NO_LOCK_SCREEN(true),
+}
 
 enum class EndReason { SCREEN_OFF, KEYGUARD_SHOWN, SHUTDOWN }
 
@@ -86,8 +95,13 @@ class Sessionizer(private val config: Config = Config()) {
         return result
     }
 
-    fun run(events: List<UsageEvent>, nowUtc: Long? = null): SessionizerResult {
-        val sorted = events.sortedWith(compareBy<UsageEvent>({ it.tsUtc }, { it.seq }))
+    /**
+     * @param gaps períodos sem dados (histórico expirado antes de ser copiado). No início de
+     * cada lacuna a sessão aberta é encerrada (fim estimado) e o estado volta a "desconhecido",
+     * para que um desbloqueio antes da lacuna não seja contado como uso durante dias.
+     */
+    fun run(events: List<UsageEvent>, nowUtc: Long? = null, gaps: List<Interval> = emptyList()): SessionizerResult {
+        val sorted = mergeGaps(events.sortedWith(compareBy<UsageEvent>({ it.tsUtc }, { it.seq })), gaps)
         val sessions = ArrayList<Session>()
         val screenOn = ArrayList<Interval>()
         val noKeyguardBySegment = segmentNoKeyguard(sorted)
@@ -120,6 +134,13 @@ class Sessionizer(private val config: Config = Config()) {
 
         for (e in sorted) {
             when (e.type) {
+                GAP_START -> {
+                    closeSession(e.tsUtc, EndReason.SHUTDOWN, e.quality, SessionFlags.ESTIMATED_END)
+                    closeScreenOn(e.tsUtc)
+                    interactive = null
+                    keyguardShown = if (noKeyguard) false else null
+                    continue
+                }
                 EventType.DEVICE_SHUTDOWN -> {
                     // O timestamp é a última gravação do banco do sistema: fim estimado.
                     closeSession(e.tsUtc, EndReason.SHUTDOWN, e.quality, SessionFlags.ESTIMATED_END)
@@ -165,7 +186,11 @@ class Sessionizer(private val config: Config = Config()) {
 
             if (!before && after) {
                 openStart = e.tsUtc
-                openReason = if (e.type == EventType.KEYGUARD_HIDDEN) StartReason.UNLOCK else StartReason.SCREEN_ON_NO_KEYGUARD
+                openReason = when {
+                    e.type == EventType.KEYGUARD_HIDDEN -> StartReason.UNLOCK
+                    noKeyguard -> StartReason.NO_LOCK_SCREEN
+                    else -> StartReason.SCREEN_ON_NO_KEYGUARD
+                }
                 openQuality = e.quality
             } else if (before && !after) {
                 val reason = if (e.type == EventType.SCREEN_NON_INTERACTIVE) EndReason.SCREEN_OFF else EndReason.KEYGUARD_SHOWN
@@ -180,5 +205,17 @@ class Sessionizer(private val config: Config = Config()) {
             Session(start, end, openReason, null, flags, openQuality)
         }
         return SessionizerResult(sessions, screenOn, open, screenOnStart, noKeyguard)
+    }
+
+    /** Insere marcadores de início de lacuna na sequência ordenada (depois dos eventos do mesmo instante). */
+    private fun mergeGaps(sorted: List<UsageEvent>, gaps: List<Interval>): List<UsageEvent> {
+        if (gaps.isEmpty()) return sorted
+        val markers = gaps.filter { it.endUtc > it.startUtc }.map { UsageEvent(it.startUtc, GAP_START, Long.MAX_VALUE) }
+        return (sorted + markers).sortedWith(compareBy<UsageEvent>({ it.tsUtc }, { it.seq }))
+    }
+
+    companion object {
+        /** Tipo interno (não existe no Android) para marcar o início de uma lacuna de dados. */
+        const val GAP_START = -1
     }
 }

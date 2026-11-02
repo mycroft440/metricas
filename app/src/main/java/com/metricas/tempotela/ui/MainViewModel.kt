@@ -153,6 +153,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
             load()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // Tela fechada no meio da atualização: não é erro.
+            throw e
         } catch (e: Exception) {
             _state.update { it.copy(message = "Erro ao atualizar: ${e.message}") }
         } finally {
@@ -287,9 +290,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             LongArray(24).also { arr -> list.forEach { arr[it.hour] = it.unlockedMs } }
         }
         val completeRecent = days.filter {
-            it.status == "COMPLETE" && LocalDate.parse(it.date).let { d -> d.isBefore(today) && !d.isBefore(today.minusDays(30)) }
+            it.status == "COMPLETE" && isTrustworthy(it) &&
+                LocalDate.parse(it.date).let { d -> d.isBefore(today) && !d.isBefore(today.minusDays(30)) }
         }
-        val typicalArrays = completeRecent.map { hourlyByDay[it.date] ?: LongArray(24) }
+        // A curva acompanha a ordem do "dia" (que começa no horário de corte, não à meia-noite).
+        val cutoff = graph.settings.dayCutoffHour
+        val typicalArrays = completeRecent.map { day ->
+            val byClockHour = hourlyByDay[day.date] ?: LongArray(24)
+            LongArray(24) { i -> byClockHour[(cutoff + i) % 24] }
+        }
         val typical = if (typicalArrays.isNotEmpty()) Stats.typicalCumulative(typicalArrays) else null
 
         val allSessions = db.sessionDao().between(Long.MIN_VALUE, resolver.dayStartUtc(today))
@@ -384,7 +393,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val d = LocalDate.parse(it.date)
             d.isBefore(today) && !d.isBefore(from)
         }
-        val eligible = inPeriod.filter { it.status == "COMPLETE" || (includePartial && it.status == "PARTIAL") }
+        val eligible = inPeriod.filter {
+            isTrustworthy(it) && (it.status == "COMPLETE" || (includePartial && it.status == "PARTIAL"))
+        }
         val values = eligible.map { DayValue(LocalDate.parse(it.date), it.unlockedMs) }
         val (weekday, weekend) = Stats.weekdayWeekend(values)
         val eligibleDates = eligible.map { it.date }.toHashSet()
@@ -432,6 +443,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             _state.update { it.copy(message = "Não foi possível abrir as configurações neste aparelho") }
         }
     }
+
+    /** Dias com inconsistência detectada não entram em médias nem na curva típica. */
+    private fun isTrustworthy(day: DailySummaryEntity): Boolean =
+        !SessionFlags.has(day.qualityFlags, SessionFlags.INCONSISTENT)
 
     private companion object {
         const val DAY_MS = 86_400_000L

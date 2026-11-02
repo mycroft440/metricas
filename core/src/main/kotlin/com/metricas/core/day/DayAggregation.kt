@@ -145,11 +145,15 @@ class DayAggregator(private val resolver: DayResolver) {
         for (s in sessions) {
             if (s.endUtc <= s.startUtc) continue
             map[resolver.dayOf(s.startUtc)]?.let { a ->
-                a.unlocks++
+                // Desbloqueio = passou pela tela de bloqueio (ou aparelho sem bloqueio).
+                // Religar a tela dentro do atraso de bloqueio é sessão, não desbloqueio.
+                if (s.startReason.isUnlock) {
+                    a.unlocks++
+                    a.hourlyUnlocks[resolver.hourOf(s.startUtc)]++
+                }
                 a.sessionDurations += s.durationMs
                 a.longestSessionMs = maxOf(a.longestSessionMs, s.durationMs)
                 a.firstUnlockUtc = minOf(a.firstUnlockUtc ?: Long.MAX_VALUE, s.startUtc)
-                a.hourlyUnlocks[resolver.hourOf(s.startUtc)]++
                 a.flags = a.flags or (s.flags and (SessionFlags.LONG or SessionFlags.ESTIMATED_END))
                 if (s.isOpen) a.hasOpenSession = true
             }

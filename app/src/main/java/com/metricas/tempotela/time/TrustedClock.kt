@@ -108,11 +108,33 @@ class TrustedClock(private val context: Context) {
 
     fun now(): Long = read().trueNowUtc
 
-    /** Precisa sincronizar: sem âncora da internet neste boot ou âncora com mais de 6 h. */
+    /**
+     * Precisa sincronizar: sem âncora da internet neste boot, âncora com mais de 6 h ou não
+     * confirmada. Para não gastar bateria/rede, não tenta de novo antes de 15 min da última
+     * tentativa (bem-sucedida ou não) no mesmo boot.
+     */
     fun needsSync(): Boolean {
         val now = snapshot()
+        val lastAttempt = lastSyncAttemptElapsed
+        if (lastAttemptBoot == now.bootCount && lastAttempt != null &&
+            now.elapsedMs - lastAttempt in 0 until SYNC_RETRY_MIN_MS
+        ) {
+            return false
+        }
         val a = ClockLogic.usable(anchor(), now) ?: return true
         return now.elapsedMs - a.elapsedMs > SYNC_MAX_AGE_MS || !a.corroborated
+    }
+
+    @Volatile
+    private var lastSyncAttemptElapsed: Long? = null
+
+    @Volatile
+    private var lastAttemptBoot: Int? = null
+
+    fun markSyncAttempt() {
+        val now = snapshot()
+        lastSyncAttemptElapsed = now.elapsedMs
+        lastAttemptBoot = now.bootCount
     }
 
     private fun rememberOffset(offset: Long) {
@@ -124,6 +146,7 @@ class TrustedClock(private val context: Context) {
 
     companion object {
         const val SYNC_MAX_AGE_MS = 6L * 60 * 60 * 1000
+        const val SYNC_RETRY_MIN_MS = 15L * 60 * 1000
         private const val KEY_BOOT = "anchor_boot"
         private const val KEY_ELAPSED = "anchor_elapsed"
         private const val KEY_TRUE = "anchor_true"

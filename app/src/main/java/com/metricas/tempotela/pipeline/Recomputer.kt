@@ -99,16 +99,22 @@ class Recomputer(
         }
         val noKeyguardHint = !DeviceState.isDeviceSecure(context)
 
-        val result = Sessionizer(Sessionizer.Config(noKeyguardHint = noKeyguardHint)).run(events, knownUntil)
+        // Cobertura: leituras unidas com tolerância (pequenos desvios após correções de hora não
+        // viram "lacuna"). Lacunas reais (dados que expiraram) interrompem as sessões.
+        val merged = Coverage.merge(
+            db.ingestRunDao().okRuns().map { Interval(it.observedStartUtc, it.observedEndUtc) },
+            joinGapMs = COVERAGE_JOIN_MS,
+        )
+        val gaps = merged.zipWithNext { a, b -> Interval(a.endUtc, b.startUtc) }
+            .filter { it.durationMs >= MIN_GAP_MS && it.endUtc > warmupStart && it.startUtc < knownUntil }
+
+        val result = Sessionizer(Sessionizer.Config(noKeyguardHint = noKeyguardHint)).run(events, knownUntil, gaps)
         val allSessions = result.sessions + listOfNotNull(result.openSession)
         val screenOn = result.screenOn +
             listOfNotNull(result.openScreenOnStartUtc?.let { Interval(it, maxOf(it, knownUntil)) })
         val sessionProblems = Invariants.sessionProblems(allSessions)
 
         val aggregates = DayAggregator(resolver).aggregate(allSessions, screenOn, fromDay, today)
-        val merged = Coverage.merge(
-            db.ingestRunDao().okRuns().map { Interval(it.observedStartUtc, it.observedEndUtc) },
-        )
 
         val summaries = aggregates.map { a ->
             val cov = Coverage.evaluate(a.dayStartUtc, a.dayEndUtc, now, merged)
@@ -190,8 +196,10 @@ class Recomputer(
     }
 
     companion object {
-        const val ALGO_VERSION = 2
+        const val ALGO_VERSION = 3
         private const val TAG = "Recomputer"
         private const val WARMUP_MS = 36L * 60 * 60 * 1000
+        private const val COVERAGE_JOIN_MS = 15L * 60 * 1000
+        private const val MIN_GAP_MS = 30L * 60 * 1000
     }
 }

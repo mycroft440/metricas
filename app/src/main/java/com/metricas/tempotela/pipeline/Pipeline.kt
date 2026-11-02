@@ -5,6 +5,7 @@ import com.metricas.tempotela.time.TimeCorrector
 import com.metricas.tempotela.time.TimeSyncer
 import com.metricas.tempotela.time.TrustedClock
 import com.metricas.tempotela.time.ZoneRecorder
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -27,6 +28,7 @@ class Pipeline(
     suspend fun syncTime(trigger: String): SyncOutcome = mutex.withLock { syncLocked(trigger) }
 
     private suspend fun syncLocked(trigger: String): SyncOutcome {
+        clock.markSyncAttempt()
         val outcome = syncer.sync(trigger)
         if (outcome is SyncOutcome.Success) {
             val affected = corrector.correctAfterSync()
@@ -39,7 +41,17 @@ class Pipeline(
 
     suspend fun refresh(trigger: String, forceSync: Boolean = false): RefreshResult = mutex.withLock {
         zones.record()
-        val sync = if (forceSync || clock.needsSync()) runCatching { syncLocked(trigger) }.getOrNull() else null
+        val sync = if (forceSync || clock.needsSync()) {
+            try {
+                syncLocked(trigger)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                null
+            }
+        } else {
+            null
+        }
         val ingest = ingestor.ingest(trigger)
         // Se esta ingestão foi feita sem hora verificada mas já existe âncora da internet
         // neste boot, corrige na hora (não espera a próxima sincronização).

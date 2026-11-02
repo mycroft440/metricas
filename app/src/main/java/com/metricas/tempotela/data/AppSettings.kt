@@ -3,9 +3,14 @@ package com.metricas.tempotela.data
 import android.content.Context
 import java.time.ZoneId
 
-/** Preferências do usuário e marcadores internos (SharedPreferences "settings"). */
+/**
+ * Preferências do usuário ("settings", incluídas no backup) e estado interno deste aparelho
+ * ("device_state", fora do backup: marca d'água, versão do algoritmo etc. não podem ir para
+ * outro aparelho, senão a primeira leitura lá pularia o histórico local).
+ */
 class AppSettings(context: Context) {
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+    private val state = context.getSharedPreferences("device_state", Context.MODE_PRIVATE)
 
     data class Snapshot(
         val referenceZoneId: String,
@@ -18,6 +23,25 @@ class AppSettings(context: Context) {
         if (!prefs.contains(KEY_ZONE)) {
             prefs.edit().putString(KEY_ZONE, ZoneId.systemDefault().id).apply()
         }
+        migrateDeviceState()
+    }
+
+    /** Versões antigas guardavam o estado interno em "settings": move para "device_state". */
+    private fun migrateDeviceState() {
+        val keys = listOf(KEY_WATERMARK, KEY_FULL_RECOMPUTE, KEY_ALGO_VERSION, KEY_LAST_PERMISSION)
+        if (keys.none { prefs.contains(it) }) return
+        val all = prefs.all
+        val editor = state.edit()
+        for (k in keys) {
+            if (state.contains(k)) continue
+            when (val v = all[k]) {
+                is Long -> editor.putLong(k, v)
+                is Int -> editor.putInt(k, v)
+                is Boolean -> editor.putBoolean(k, v)
+            }
+        }
+        editor.commit()
+        prefs.edit().apply { keys.forEach { remove(it) } }.apply()
     }
 
     var referenceZoneId: String
@@ -38,27 +62,27 @@ class AppSettings(context: Context) {
 
     /** Fim (em hora real) da última janela ingerida com sucesso. */
     var watermarkUtc: Long?
-        get() = if (prefs.contains(KEY_WATERMARK)) prefs.getLong(KEY_WATERMARK, 0) else null
+        get() = if (state.contains(KEY_WATERMARK)) state.getLong(KEY_WATERMARK, 0) else null
         set(value) {
-            if (value == null) prefs.edit().remove(KEY_WATERMARK).apply()
-            else prefs.edit().putLong(KEY_WATERMARK, value).apply()
+            if (value == null) state.edit().remove(KEY_WATERMARK).apply()
+            else state.edit().putLong(KEY_WATERMARK, value).apply()
         }
 
     /** Pede recálculo completo na próxima vez (mudança de fuso/corte). */
     var needsFullRecompute: Boolean
-        get() = prefs.getBoolean(KEY_FULL_RECOMPUTE, true)
-        set(value) = prefs.edit().putBoolean(KEY_FULL_RECOMPUTE, value).apply()
+        get() = state.getBoolean(KEY_FULL_RECOMPUTE, true)
+        set(value) = state.edit().putBoolean(KEY_FULL_RECOMPUTE, value).apply()
 
     /** Versão do algoritmo usada no último recálculo completo. */
     var algoVersion: Int
-        get() = prefs.getInt(KEY_ALGO_VERSION, 0)
-        set(value) = prefs.edit().putInt(KEY_ALGO_VERSION, value).apply()
+        get() = state.getInt(KEY_ALGO_VERSION, 0)
+        set(value) = state.edit().putInt(KEY_ALGO_VERSION, value).apply()
 
     var lastPermissionGranted: Boolean?
-        get() = if (prefs.contains(KEY_LAST_PERMISSION)) prefs.getBoolean(KEY_LAST_PERMISSION, false) else null
+        get() = if (state.contains(KEY_LAST_PERMISSION)) state.getBoolean(KEY_LAST_PERMISSION, false) else null
         set(value) {
-            if (value == null) prefs.edit().remove(KEY_LAST_PERMISSION).apply()
-            else prefs.edit().putBoolean(KEY_LAST_PERMISSION, value).apply()
+            if (value == null) state.edit().remove(KEY_LAST_PERMISSION).apply()
+            else state.edit().putBoolean(KEY_LAST_PERMISSION, value).apply()
         }
 
     fun referenceZone(): ZoneId = try {

@@ -174,7 +174,9 @@ private fun TypicalComparison(state: UiState, liveMs: Long, now: Long) {
         return
     }
     val zdt = Instant.ofEpochMilli(now).atZone(state.zone)
-    val hourFraction = zdt.hour + zdt.minute / 60.0 + zdt.second / 3600.0
+    val cutoff = state.settings?.dayCutoffHour ?: 0
+    // Posição dentro do "dia", que começa no horário de corte.
+    val hourFraction = ((zdt.hour - cutoff + 24) % 24) + zdt.minute / 60.0 + zdt.second / 3600.0
     val typicalNow = Stats.typicalAt(typical, hourFraction)
     val typicalDay = typical[23]
     val diff = liveMs - typicalNow
